@@ -7,3 +7,4 @@ target-features = ["ssse3"]
 
 [dependencies]
 aligned = "0.3"
+hibitset = "0.5"
