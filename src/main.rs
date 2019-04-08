@@ -45,34 +45,37 @@ impl BitSet {
     }
 }
 
+const LEVEL2_BATCH: usize = 16;
+const LEVEL1_BATCH: usize = 16;
+const LEVEL0_BATCH: usize = 16;
+
 #[repr(align(16))]
 pub struct BitSetIter<'a, D: Decoder> {
-    level2_buffer: [u32; 1024],
-    level1_buffer: [u32; 1024],
-    level0_buffer: [u32; 1024],
+    level2_buffer: [u32; 64 * LEVEL2_BATCH],
+    level1_buffer: [u32; 64 * LEVEL1_BATCH],
+    level0_buffer: [u32; 64 * LEVEL0_BATCH],
     level2_len: usize,
     level1_len: usize,
     level0_len: usize,
     level2_idx: usize,
     level1_idx: usize,
     level0_idx: usize,
-
     bitset: &'a BitSet,
     marker: std::marker::PhantomData<D>,
 }
 
 impl<'a, D: Decoder> BitSetIter<'a, D> {
     fn new(bitset: &'a BitSet) -> Self {
-        debug_assert!(bitset.level2.len() <= 1024 / 64);
+        debug_assert!(bitset.level2.len() <= LEVEL2_BATCH);
         let mut this = Self {
-            level2_buffer: [0; 1024],
-            level1_buffer: [0; 1024],
-            level0_buffer: [0; 1024],
+            level2_buffer: [0; 64 * LEVEL2_BATCH],
+            level1_buffer: [0; 64 * LEVEL1_BATCH],
+            level0_buffer: [0; 64 * LEVEL0_BATCH],
             level2_len: 0,
             level1_len: 0,
             level0_len: 0,
-            level2_idx: 16,
-            level1_idx: 16,
+            level2_idx: LEVEL1_BATCH,
+            level1_idx: LEVEL0_BATCH,
             level0_idx: 0,
             bitset,
             marker: std::marker::PhantomData,
@@ -83,14 +86,20 @@ impl<'a, D: Decoder> BitSetIter<'a, D> {
 
             let l2_buf = &this.level2_buffer[0..this.level2_len as usize];
             this.level1_len = D::decode_slice(
-                l2_buf.iter().take(16).map(|b| &bitset.level1[*b as usize]),
+                l2_buf
+                    .iter()
+                    .take(LEVEL1_BATCH)
+                    .map(|b| &bitset.level1[*b as usize]),
                 l2_buf.iter().map(|b| b * 64),
                 &mut this.level1_buffer,
             ) as _;
 
             let l1_buf = &this.level1_buffer[0..this.level1_len as usize];
             this.level0_len = D::decode_slice(
-                l1_buf.iter().take(16).map(|b| &bitset.level0[*b as usize]),
+                l1_buf
+                    .iter()
+                    .take(LEVEL0_BATCH)
+                    .map(|b| &bitset.level0[*b as usize]),
                 l1_buf.iter().map(|b| b * 64),
                 &mut this.level0_buffer,
             ) as _;
@@ -120,13 +129,13 @@ impl<'a, D: Decoder> Iterator for BitSetIter<'a, D> {
                     self.level1_len = D::decode_slice(
                         l2_buf
                             .iter()
-                            .take(16)
+                            .take(LEVEL1_BATCH)
                             .map(|b| bitset.level1.get_unchecked(*b as usize)),
                         l2_buf.iter().map(|b| b * 64),
                         &mut self.level1_buffer,
                     ) as _;
 
-                    self.level2_idx += 16;
+                    self.level2_idx += LEVEL1_BATCH;
                     self.level1_idx = 0;
                 }
 
@@ -134,12 +143,12 @@ impl<'a, D: Decoder> Iterator for BitSetIter<'a, D> {
                 self.level0_len = D::decode_slice(
                     l1_buf
                         .iter()
-                        .take(16)
+                        .take(LEVEL0_BATCH)
                         .map(|b| bitset.level0.get_unchecked(*b as usize)),
                     l1_buf.iter().map(|b| b * 64),
                     &mut self.level0_buffer,
                 ) as _;
-                self.level1_idx += 16;
+                self.level1_idx += LEVEL0_BATCH;
                 self.level0_idx = 0;
             }
 
