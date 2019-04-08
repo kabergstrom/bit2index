@@ -4,16 +4,20 @@
 
 extern crate test;
 use aligned::{Aligned, A16};
+use hibitset::BitSetLike;
 use std::arch::x86_64::*;
 
+const BITS_PER_PRIM: usize = std::mem::size_of::<u64>() * 8;
+
 pub struct BitSet {
+    level3: u64,
     level2: Vec<u64>,
     level1: Vec<u64>,
     level0: Vec<u64>,
 }
 
 fn next_layer(data: &[u64]) -> Vec<u64> {
-    data.chunks(64)
+    data.chunks(BITS_PER_PRIM)
         .map(|chunk| {
             let mut val = 0;
             for (i, &mask) in chunk.iter().enumerate() {
@@ -30,47 +34,80 @@ impl BitSet {
     pub fn from_level0(level0: Vec<u64>) -> Self {
         let level1 = next_layer(&level0);
         let level2 = next_layer(&level1);
+        let level3 = next_layer(&level2);
+        assert!(level3.len() <= 1);
         BitSet {
+            level3: level3.get(0).cloned().unwrap_or(0),
             level2,
             level1,
             level0,
         }
     }
+}
 
+trait IntoDecodeIter: BitSetLike + Sized {
+    fn decode_iter<'a, D: Decoder>(&'a self) -> BitSetIter<'a, D, Self>;
+}
+
+impl<T: BitSetLike> IntoDecodeIter for T {
     // NOTE: The key here is obviously getting rid of vec allocations/clones.
     // This is obviously hard due to borrowing rules. I was able to reduce it to
     // one clone per chunk by providing buffers from outside.
-    pub fn iter<'a, D: Decoder>(&'a self) -> BitSetIter<'a, D> {
-        BitSetIter::<D>::new(self)
+    fn decode_iter<'a, D: Decoder>(&'a self) -> BitSetIter<'a, D, Self> {
+        BitSetIter::<D, Self>::new(self)
     }
 }
 
 const LEVEL2_BATCH: usize = 16;
-const LEVEL1_BATCH: usize = 16;
-const LEVEL0_BATCH: usize = 16;
+const LEVEL1_BATCH: usize = 4;
+const LEVEL0_BATCH: usize = 4;
+
+impl BitSetLike for BitSet {
+    fn layer3(&self) -> usize {
+        self.level3 as usize
+    }
+
+    fn layer2(&self, i: usize) -> usize {
+        self.level2.get(i).cloned().unwrap_or(0) as usize
+    }
+
+    fn layer1(&self, i: usize) -> usize {
+        self.level1.get(i).cloned().unwrap_or(0) as usize
+    }
+
+    fn layer0(&self, i: usize) -> usize {
+        self.level0.get(i).cloned().unwrap_or(0) as usize
+    }
+
+    fn contains(&self, i: u32) -> bool {
+        self.level0
+            .get(i as usize / 64)
+            .map_or(false, |b| b & (1 << i) != 0)
+    }
+}
 
 #[repr(align(16))]
-pub struct BitSetIter<'a, D: Decoder> {
-    level2_buffer: [u32; 64 * LEVEL2_BATCH],
-    level1_buffer: [u32; 64 * LEVEL1_BATCH],
-    level0_buffer: [u32; 64 * LEVEL0_BATCH],
+pub struct BitSetIter<'a, D: Decoder, B: BitSetLike + 'a> {
+    level2_buffer: [u32; BITS_PER_PRIM * LEVEL2_BATCH],
+    level1_buffer: [u32; BITS_PER_PRIM * LEVEL1_BATCH],
+    level0_buffer: [u32; BITS_PER_PRIM * LEVEL0_BATCH],
     level2_len: usize,
     level1_len: usize,
     level0_len: usize,
     level2_idx: usize,
     level1_idx: usize,
     level0_idx: usize,
-    bitset: &'a BitSet,
+    bitset: &'a B,
     marker: std::marker::PhantomData<D>,
 }
 
-impl<'a, D: Decoder> BitSetIter<'a, D> {
-    fn new(bitset: &'a BitSet) -> Self {
-        debug_assert!(bitset.level2.len() <= LEVEL2_BATCH);
+impl<'a, D: Decoder, B: BitSetLike + 'a> BitSetIter<'a, D, B> {
+    fn new(bitset: &'a B) -> Self {
+        // debug_assert!(bitset.level2.len() <= LEVEL2_BATCH);
         let mut this = Self {
-            level2_buffer: [0; 64 * LEVEL2_BATCH],
-            level1_buffer: [0; 64 * LEVEL1_BATCH],
-            level0_buffer: [0; 64 * LEVEL0_BATCH],
+            level2_buffer: [0; BITS_PER_PRIM * LEVEL2_BATCH],
+            level1_buffer: [0; BITS_PER_PRIM * LEVEL1_BATCH],
+            level0_buffer: [0; BITS_PER_PRIM * LEVEL0_BATCH],
             level2_len: 0,
             level1_len: 0,
             level0_len: 0,
@@ -80,27 +117,35 @@ impl<'a, D: Decoder> BitSetIter<'a, D> {
             bitset,
             marker: std::marker::PhantomData,
         };
-        unsafe {
-            this.level2_len =
-                D::decode_slice(&bitset.level2, (0..).step_by(64), &mut this.level2_buffer) as _;
 
-            let l2_buf = &this.level2_buffer[0..this.level2_len as usize];
+        if bitset.layer3() == 0 {
+            return this;
+        }
+
+        unsafe {
+            this.level2_len = D::decode_slice(
+                (0..LEVEL2_BATCH).map(|i| bitset.layer2(i) as _),
+                (0..).step_by(BITS_PER_PRIM),
+                &mut this.level2_buffer,
+            ) as _;
+
+            let l2_buf = &this.level2_buffer[0..this.level2_len as _];
             this.level1_len = D::decode_slice(
                 l2_buf
                     .iter()
                     .take(LEVEL1_BATCH)
-                    .map(|b| &bitset.level1[*b as usize]),
-                l2_buf.iter().map(|b| b * 64),
+                    .map(|b| bitset.layer1(*b as _) as _),
+                l2_buf.iter().map(|b| b * BITS_PER_PRIM as u32),
                 &mut this.level1_buffer,
             ) as _;
 
-            let l1_buf = &this.level1_buffer[0..this.level1_len as usize];
+            let l1_buf = &this.level1_buffer[0..this.level1_len as _];
             this.level0_len = D::decode_slice(
                 l1_buf
                     .iter()
                     .take(LEVEL0_BATCH)
-                    .map(|b| &bitset.level0[*b as usize]),
-                l1_buf.iter().map(|b| b * 64),
+                    .map(|b| bitset.layer0(*b as _) as _),
+                l1_buf.iter().map(|b| b * BITS_PER_PRIM as u32),
                 &mut this.level0_buffer,
             ) as _;
         }
@@ -108,7 +153,7 @@ impl<'a, D: Decoder> BitSetIter<'a, D> {
     }
 }
 
-impl<'a, D: Decoder> Iterator for BitSetIter<'a, D> {
+impl<'a, D: Decoder, B: BitSetLike> Iterator for BitSetIter<'a, D, B> {
     type Item = u32;
     fn next(&mut self) -> Option<u32> {
         if self.level0_len == 0 {
@@ -130,8 +175,8 @@ impl<'a, D: Decoder> Iterator for BitSetIter<'a, D> {
                         l2_buf
                             .iter()
                             .take(LEVEL1_BATCH)
-                            .map(|b| bitset.level1.get_unchecked(*b as usize)),
-                        l2_buf.iter().map(|b| b * 64),
+                            .map(|b| bitset.layer1(*b as usize) as _),
+                        l2_buf.iter().map(|b| b * BITS_PER_PRIM as u32),
                         &mut self.level1_buffer,
                     ) as _;
 
@@ -144,8 +189,8 @@ impl<'a, D: Decoder> Iterator for BitSetIter<'a, D> {
                     l1_buf
                         .iter()
                         .take(LEVEL0_BATCH)
-                        .map(|b| bitset.level0.get_unchecked(*b as usize)),
-                    l1_buf.iter().map(|b| b * 64),
+                        .map(|b| bitset.layer0(*b as usize) as _),
+                    l1_buf.iter().map(|b| b * BITS_PER_PRIM as u32),
                     &mut self.level0_buffer,
                 ) as _;
                 self.level1_idx += LEVEL0_BATCH;
@@ -160,26 +205,27 @@ impl<'a, D: Decoder> Iterator for BitSetIter<'a, D> {
 }
 
 pub trait Decoder {
-    fn decode<'a, I, O>(bitmap: I, offset: O, out: &mut Vec<u32>) -> usize
+    fn decode<I, O>(bitmap: I, offset: O, out: &mut Vec<u32>) -> usize
     where
-        I: IntoIterator<Item = &'a u64>,
+        I: IntoIterator<Item = u64>,
         I::IntoIter: ExactSizeIterator,
         O: IntoIterator<Item = u32>,
     {
         let bitmap_iter = bitmap.into_iter();
         out.clear();
-        out.reserve(bitmap_iter.len() * 64);
+        out.reserve(bitmap_iter.len() * BITS_PER_PRIM);
         unsafe {
-            let slice = std::slice::from_raw_parts_mut(out.as_mut_ptr(), bitmap_iter.len() * 64);
+            let slice =
+                std::slice::from_raw_parts_mut(out.as_mut_ptr(), bitmap_iter.len() * BITS_PER_PRIM);
             let len = Self::decode_slice(bitmap_iter, offset, slice);
             out.set_len(len);
             len
         }
     }
 
-    unsafe fn decode_slice<'a, I, O>(bitmap: I, offset: O, out: &mut [u32]) -> usize
+    unsafe fn decode_slice<I, O>(bitmap: I, offset: O, out: &mut [u32]) -> usize
     where
-        I: IntoIterator<Item = &'a u64>,
+        I: IntoIterator<Item = u64>,
         I::IntoIter: ExactSizeIterator,
         O: IntoIterator<Item = u32>;
 }
@@ -190,9 +236,9 @@ pub struct Sse2Decoder;
 
 impl Decoder for NaiveDecoder {
     #[inline(always)]
-    unsafe fn decode_slice<'a, I, O>(bitmap: I, offset: O, out: &mut [u32]) -> usize
+    unsafe fn decode_slice<I, O>(bitmap: I, offset: O, out: &mut [u32]) -> usize
     where
-        I: IntoIterator<Item = &'a u64>,
+        I: IntoIterator<Item = u64>,
         I::IntoIter: ExactSizeIterator,
         O: IntoIterator<Item = u32>,
     {
@@ -202,9 +248,9 @@ impl Decoder for NaiveDecoder {
 
 impl Decoder for CtzDecoder {
     #[inline(always)]
-    unsafe fn decode_slice<'a, I, O>(bitmap: I, offset: O, out: &mut [u32]) -> usize
+    unsafe fn decode_slice<I, O>(bitmap: I, offset: O, out: &mut [u32]) -> usize
     where
-        I: IntoIterator<Item = &'a u64>,
+        I: IntoIterator<Item = u64>,
         I::IntoIter: ExactSizeIterator,
         O: IntoIterator<Item = u32>,
     {
@@ -214,9 +260,9 @@ impl Decoder for CtzDecoder {
 
 impl Decoder for Sse2Decoder {
     #[inline(always)]
-    unsafe fn decode_slice<'a, I, O>(bitmap: I, offset: O, out: &mut [u32]) -> usize
+    unsafe fn decode_slice<I, O>(bitmap: I, offset: O, out: &mut [u32]) -> usize
     where
-        I: IntoIterator<Item = &'a u64>,
+        I: IntoIterator<Item = u64>,
         I::IntoIter: ExactSizeIterator,
         O: IntoIterator<Item = u32>,
     {
@@ -247,7 +293,7 @@ fn main() {
     // bitmap_decode_naive(&values, &mut out);
 
     let out: Vec<_> = BitSet::from_level0(bitmap.clone())
-        .iter::<Sse2Decoder>()
+        .decode_iter::<Sse2Decoder>()
         .collect();
     println!("{:b} -- {:?}", bitmap[0], out);
 }
@@ -311,9 +357,9 @@ unsafe fn lookup_index(mask: u16) -> __m128i {
     _mm_load_si128(LUT_INDICES.as_ptr().offset(mask as isize) as _)
 }
 
-unsafe fn bitmap_decode_sse2<'a, I, O>(bitmap: I, offsets: O, out: &mut [u32]) -> usize
+unsafe fn bitmap_decode_sse2<I, O>(bitmap: I, offsets: O, out: &mut [u32]) -> usize
 where
-    I: IntoIterator<Item = &'a u64>,
+    I: IntoIterator<Item = u64>,
     I::IntoIter: ExactSizeIterator,
     O: IntoIterator<Item = u32>,
 {
@@ -324,7 +370,7 @@ where
 
     debug_assert!(out.len() >= bitmap_iter.len() * 64);
 
-    for &bits in bitmap_iter {
+    for bits in bitmap_iter {
         let offset = offset_iter.next().unwrap();
         // if bits == 0 {
         //     continue;
@@ -387,16 +433,16 @@ where
     out_pos
 }
 
-pub unsafe fn bitmap_decode_naive<'a, I, O>(bitmap: I, offset: O, out: &mut [u32]) -> usize
+pub unsafe fn bitmap_decode_naive<I, O>(bitmap: I, offset: O, out: &mut [u32]) -> usize
 where
-    I: IntoIterator<Item = &'a u64>,
+    I: IntoIterator<Item = u64>,
     I::IntoIter: ExactSizeIterator,
     O: IntoIterator<Item = u32>,
 {
     let mut pos = 0;
     let bitmap_iter = bitmap.into_iter();
     debug_assert!(out.len() >= bitmap_iter.len() * 64);
-    for (&v, offset) in bitmap_iter.zip(offset) {
+    for (v, offset) in bitmap_iter.zip(offset) {
         let mut bitset = v;
         let mut p = offset;
         while bitset != 0 {
@@ -411,9 +457,9 @@ where
     pos
 }
 
-pub unsafe fn bitmap_decode_ctz<'a, I, O>(bitmap: I, offset: O, out: &mut [u32]) -> usize
+pub unsafe fn bitmap_decode_ctz<I, O>(bitmap: I, offset: O, out: &mut [u32]) -> usize
 where
-    I: IntoIterator<Item = &'a u64>,
+    I: IntoIterator<Item = u64>,
     I::IntoIter: ExactSizeIterator,
     O: IntoIterator<Item = u32>,
 {
@@ -421,7 +467,7 @@ where
     let bitmap_iter = bitmap.into_iter();
     debug_assert!(out.len() >= bitmap_iter.len() * 64);
 
-    for (&v, offset) in bitmap_iter.zip(offset) {
+    for (v, offset) in bitmap_iter.zip(offset) {
         let mut bitset = v as i64;
         while bitset != 0 {
             let t: i64 = bitset & bitset.overflowing_neg().0;
@@ -456,8 +502,8 @@ mod tests {
             .chain(repeat(0u64).take(1000))
             .chain(repeat(0xFFFFFFFFFFFFFFFFu64).take(500))
             .chain(repeat(0xbbae187bfcdd3b05u64).take(1234))
-            .chain(repeat(0xd7156e450545b7adu64).take(2456))
-            .chain(repeat(0u64).take(1500))
+            .chain(repeat(0xd7156e450545b7adu64).take(1456))
+            .chain(repeat(0u64).take(7500))
             .chain(repeat(0x5555555555555555u64).take(55))
             .chain(repeat(0u64).take(50))
             .collect();
@@ -484,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_sse2_equal_bitset() {
-        // let mut bitmap = vec![0xbbae187b00003b05, 0, 1];
+        // let bitmap = vec![0xbbae187b00003b05, 0, 1];
         // bitmap.resize(64 * 64 - 1, 0);
         // bitmap.push(1);
         // dbg!(bitmap.len());
@@ -492,42 +538,59 @@ mod tests {
         let bitset = BitSet::from_level0(bitmap.clone());
 
         let mut sse2_values = Vec::with_capacity(bitmap.len() * 64);
-        Sse2Decoder::decode(&bitmap, (0..).step_by(64), &mut sse2_values);
+        Sse2Decoder::decode(bitmap.iter().cloned(), (0..).step_by(64), &mut sse2_values);
         assert_eq!(
             sse2_values,
-            bitset.iter::<Sse2Decoder>().collect::<Vec<_>>()
+            bitset.decode_iter::<Sse2Decoder>().collect::<Vec<_>>()
         );
     }
 
     #[test]
     fn test_sse2_equal_naive() {
         let bitmap = vec![0xbbae187b00003b05u64; 10];
-        let mut naive_values = Vec::with_capacity(bitmap.len() * 64);
-        let mut sse2_values = Vec::with_capacity(bitmap.len() * 64);
-        let naive_len = NaiveDecoder::decode(&bitmap, (0..).step_by(64), &mut naive_values);
-        let sse2_len = Sse2Decoder::decode(&bitmap, (0..).step_by(64), &mut sse2_values);
+        let mut naive_values = Vec::with_capacity(bitmap.len() * BITS_PER_PRIM);
+        let mut sse2_values = Vec::with_capacity(bitmap.len() * BITS_PER_PRIM);
+        let naive_len =
+            NaiveDecoder::decode(bitmap.iter().cloned(), (0..).step_by(64), &mut naive_values);
+        let sse2_len =
+            Sse2Decoder::decode(bitmap.iter().cloned(), (0..).step_by(64), &mut sse2_values);
         assert_eq!(naive_len, sse2_len);
         assert_eq!(naive_values, sse2_values);
     }
 
     fn bench_decode<D: Decoder>(b: &mut Bencher, bitmap: &[u64]) {
-        let mut values = Vec::with_capacity(bitmap.len() * 64);
+        let mut values = Vec::with_capacity(bitmap.len() * BITS_PER_PRIM);
         b.iter(|| {
             values.clear();
             test::black_box(D::decode(
-                test::black_box(bitmap),
+                test::black_box(bitmap.iter().cloned()),
                 (0..).step_by(64),
                 &mut values,
             ));
         })
     }
 
-    fn bench_bitset<D: Decoder>(b: &mut Bencher, bitmap: &[u64]) {
-        let mut values = Vec::with_capacity(bitmap.len() * 64);
-        let bitset = BitSet::from_level0(bitmap.iter().cloned().collect());
+    fn bench_bitset_old(b: &mut Bencher, bitmap: &[u64]) {
+        let mut values = Vec::with_capacity(bitmap.len() * BITS_PER_PRIM);
+        let bitset_conv = BitSet::from_level0(bitmap.iter().cloned().collect());
+        let mut hibitset = hibitset::BitSet::new();
+        hibitset.extend(bitset_conv.iter());
+
         b.iter(|| {
             values.clear();
-            test::black_box(values.extend(bitset.iter::<D>()));
+            test::black_box(values.extend((&hibitset).iter()));
+        })
+    }
+
+    fn bench_bitset<D: Decoder>(b: &mut Bencher, bitmap: &[u64]) {
+        let mut values = Vec::with_capacity(bitmap.len() * BITS_PER_PRIM);
+        let bitset_conv = BitSet::from_level0(bitmap.iter().cloned().collect());
+        let mut hibitset = hibitset::BitSet::new();
+        hibitset.extend(bitset_conv.iter());
+
+        b.iter(|| {
+            values.clear();
+            test::black_box(values.extend(hibitset.decode_iter::<D>()));
         })
     }
 
@@ -557,6 +620,31 @@ mod tests {
     }
 
     #[bench]
+    fn bench_old_bitset_empty(b: &mut Bencher) {
+        bench_bitset_old(b, &empty_buf());
+    }
+    #[bench]
+    fn bench_old_bitset_full(b: &mut Bencher) {
+        bench_bitset_old(b, &full_buff());
+    }
+    #[bench]
+    fn bench_old_bitset_test(b: &mut Bencher) {
+        bench_bitset_old(b, &VEC_DECODE_TABLE);
+    }
+    #[bench]
+    fn bench_old_bitset_interleaved(b: &mut Bencher) {
+        bench_bitset_old(b, &interleaved_buf());
+    }
+    #[bench]
+    fn bench_old_bitset_random(b: &mut Bencher) {
+        bench_bitset_old(b, &random_num_buf());
+    }
+    #[bench]
+    fn bench_old_bitset_blocky(b: &mut Bencher) {
+        bench_bitset_old(b, &blocky_buf());
+    }
+
+    #[bench]
     fn bench_sse2_bitset_empty(b: &mut Bencher) {
         bench_bitset::<Sse2Decoder>(b, &empty_buf());
     }
@@ -579,6 +667,56 @@ mod tests {
     #[bench]
     fn bench_sse2_bitset_blocky(b: &mut Bencher) {
         bench_bitset::<Sse2Decoder>(b, &blocky_buf());
+    }
+
+    #[bench]
+    fn bench_naive_bitset_empty(b: &mut Bencher) {
+        bench_bitset::<NaiveDecoder>(b, &empty_buf());
+    }
+    #[bench]
+    fn bench_naive_bitset_full(b: &mut Bencher) {
+        bench_bitset::<NaiveDecoder>(b, &full_buff());
+    }
+    #[bench]
+    fn bench_naive_bitset_test(b: &mut Bencher) {
+        bench_bitset::<NaiveDecoder>(b, &VEC_DECODE_TABLE);
+    }
+    #[bench]
+    fn bench_naive_bitset_interleaved(b: &mut Bencher) {
+        bench_bitset::<NaiveDecoder>(b, &interleaved_buf());
+    }
+    #[bench]
+    fn bench_naive_bitset_random(b: &mut Bencher) {
+        bench_bitset::<NaiveDecoder>(b, &random_num_buf());
+    }
+    #[bench]
+    fn bench_naive_bitset_blocky(b: &mut Bencher) {
+        bench_bitset::<NaiveDecoder>(b, &blocky_buf());
+    }
+
+    #[bench]
+    fn bench_ctz_bitset_empty(b: &mut Bencher) {
+        bench_bitset::<CtzDecoder>(b, &empty_buf());
+    }
+    #[bench]
+    fn bench_ctz_bitset_full(b: &mut Bencher) {
+        bench_bitset::<CtzDecoder>(b, &full_buff());
+    }
+    #[bench]
+    fn bench_ctz_bitset_test(b: &mut Bencher) {
+        bench_bitset::<CtzDecoder>(b, &VEC_DECODE_TABLE);
+    }
+    #[bench]
+    fn bench_ctz_bitset_interleaved(b: &mut Bencher) {
+        bench_bitset::<CtzDecoder>(b, &interleaved_buf());
+    }
+    #[bench]
+    fn bench_ctz_bitset_random(b: &mut Bencher) {
+        bench_bitset::<CtzDecoder>(b, &random_num_buf());
+    }
+    #[bench]
+    fn bench_ctz_bitset_blocky(b: &mut Bencher) {
+        bench_bitset::<CtzDecoder>(b, &blocky_buf());
     }
 
     #[bench]
