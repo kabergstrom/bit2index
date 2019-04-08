@@ -4,44 +4,147 @@
 
 extern crate test;
 use aligned::{Aligned, A16};
-use hibitset::BitSet;
 use std::arch::x86_64::*;
-fn main() {
-    println!("Hello, world!");
-    let mut bitset = BitSet::new();
-    bitset.add(1_048_575);
-    println!("bitset {:?}", bitset);
-    let mut out = Vec::new();
-    out.resize(64, 0);
-    unsafe {
-        // bitmap_decode_sse2(&[0xFFFFFFFFFFFFFFFFu64], &mut out);
-        // let values = [0x305u64];
-        let values = [0xABCDEFu64];
-        // let values = [0xFFFFFFFFFFFFFFFFu64];
-        // let num_values = bitmap_decode_sse2(&values, &mut out);
-        // let num_values = bitmap_decode_supernaive(&values, &mut out);
-        // let num_values = bitmap_decode_naive(&values, &mut out);
-        let num_values = bitmap_decode_ssse3(&values, &mut out);
-        // let num_values = bitmap_decode_naive(&values, &mut out);
-        // out.resize(num_values as usize, 0);
-        println!("{:b} -- {:?}", values[0], out);
-        // // bitmap_decode_sse2(&[0x0000000000000000u64], &mut out);
-        // // let (x, y, z, w) = bits_to_bytes(84, 0x0F);
-        // use std::mem::transmute;
-        // let packed = pack_left_sse2(
-        //     0x0101,
-        //     _mm_set_ps(
-        //         transmute(0xFF00FF),
-        //         transmute(0xFF00),
-        //         transmute(0x0F0F),
-        //         transmute(0xF0F0),
-        //     ),
-        // );
-        // print_bytes("result", _mm_castps_si128(packed));
+
+struct BitSet {
+    level2: Vec<u64>,
+    level1: Vec<u64>,
+    level0: Vec<u64>,
+}
+
+fn next_level(data: &[u64]) -> Vec<u64> {
+    data.chunks(64)
+        .map(|chunk| {
+            let mut val = 0;
+            for (i, &mask) in chunk.iter().enumerate() {
+                if mask != 0 {
+                    val = val | (1 << i);
+                }
+            }
+            val
+        })
+        .collect()
+}
+
+impl BitSet {
+    pub fn from_level0(level0: Vec<u64>) -> Self {
+        let level1 = next_level(&level0);
+        let level2 = next_level(&level1);
+        BitSet {
+            level2,
+            level1,
+            level0,
+        }
+    }
+
+    // NOTE: The key here is obviously getting rid of vec allocations/clones.
+    // This is obviously hard due to borrowing rules. I was able to reduce it to
+    // one clone per chunk by providing buffers from outside.
+    pub fn iter<'a, D: Decoder>(
+        &'a self,
+        buffer0: &'a mut Vec<u32>,
+        buffer1: &'a mut Vec<u32>,
+    ) -> impl Iterator<Item = u32> + 'a {
+        self.level2
+            .chunks(1024)
+            .enumerate()
+            .flat_map(move |(i, chunk)| {
+                D::decode(chunk, (i as u32 * 1024..).step_by(64), buffer0);
+                D::decode(
+                    buffer0.iter().map(|b| &self.level1[*b as usize]),
+                    buffer0.iter().map(|b| b * 64),
+                    buffer1,
+                );
+                D::decode(
+                    buffer1.iter().map(|b| &self.level0[*b as usize]),
+                    buffer1.iter().map(|b| b * 64),
+                    buffer0,
+                );
+                buffer0.clone().into_iter()
+            })
     }
 }
 
-unsafe fn print_bytes(prefix: &str, x: __m128i) {
+trait Decoder {
+    fn decode<'a, I, O>(bitmap: I, offset: O, out: &mut Vec<u32>) -> usize
+    where
+        I: IntoIterator<Item = &'a u64>,
+        I::IntoIter: ExactSizeIterator,
+        O: IntoIterator<Item = u32>;
+}
+
+pub struct NaiveDecoder;
+pub struct CtzDecoder;
+pub struct Sse2Decoder;
+
+impl Decoder for NaiveDecoder {
+    #[inline(always)]
+    fn decode<'a, I, O>(bitmap: I, offset: O, out: &mut Vec<u32>) -> usize
+    where
+        I: IntoIterator<Item = &'a u64>,
+        I::IntoIter: ExactSizeIterator,
+        O: IntoIterator<Item = u32>,
+    {
+        bitmap_decode_naive(bitmap, offset, out)
+    }
+}
+
+impl Decoder for CtzDecoder {
+    #[inline(always)]
+    fn decode<'a, I, O>(bitmap: I, offset: O, out: &mut Vec<u32>) -> usize
+    where
+        I: IntoIterator<Item = &'a u64>,
+        I::IntoIter: ExactSizeIterator,
+        O: IntoIterator<Item = u32>,
+    {
+        bitmap_decode_ctz(bitmap, offset, out)
+    }
+}
+
+impl Decoder for Sse2Decoder {
+    #[inline(always)]
+    fn decode<'a, I, O>(bitmap: I, offset: O, out: &mut Vec<u32>) -> usize
+    where
+        I: IntoIterator<Item = &'a u64>,
+        I::IntoIter: ExactSizeIterator,
+        O: IntoIterator<Item = u32>,
+    {
+        unsafe { bitmap_decode_sse2(bitmap, offset, out) }
+    }
+}
+
+fn main() {
+    println!("Hello, world!");
+    // let mut bitset = BitSet::new();
+    // bitset.add(1_048_575);
+    // println!("bitset {:?}", bitset);
+    let mut out = Vec::new();
+
+    // bitmap_decode_sse2(&[0xFFFFFFFFFFFFFFFFu64], &mut out);
+    // let values = [0x305u64];
+    let values = [0xABCDEFu64];
+    // let values = [0xFFFFFFFFFFFFFFFFu64];
+    // let num_values = bitmap_decode_supernaive(&values, &mut out);
+    // let num_values = bitmap_decode_naive(&values, &mut out);
+    Sse2Decoder::decode(&values, (0..).step_by(64), &mut out);
+    // let num_values = bitmap_decode_naive(&values, &mut out);
+    println!("{:b} -- {:?}", values[0], out);
+    // // bitmap_decode_sse2(&[0x0000000000000000u64], &mut out);
+    // // let (x, y, z, w) = bits_to_bytes(84, 0x0F);
+    // use std::mem::transmute;
+    // let packed = pack_left_sse2(
+    //     0x0101,
+    //     _mm_set_ps(
+    //         transmute(0xFF00FF),
+    //         transmute(0xFF00),
+    //         transmute(0x0F0F),
+    //         transmute(0xF0F0),
+    //     ),
+    // );
+    // print_bytes("result", _mm_castps_si128(packed));
+}
+
+pub unsafe fn print_bytes(prefix: &str, x: __m128i) {
     println!(
         "{} x: {:x} y: {:x}, z: {:x}, w: {:x} ",
         prefix,
@@ -52,307 +155,78 @@ unsafe fn print_bytes(prefix: &str, x: __m128i) {
     );
 }
 
-unsafe fn print_bytes_u8(prefix: &str, x: __m128i) {
-    println!(
-        "{} x: {:x} y: {:x}, z: {:x}, w: {:x} a: {:x} b: {:x}, c: {:x}, d: {:x} e: {:x} f: {:x}, g: {:x}, h: {:x} i: {:x} j: {:x}, k: {:x}, l: {:x}",
-        prefix,
-        _mm_extract_epi8(x, 0),
-        _mm_extract_epi8(x, 1),
-        _mm_extract_epi8(x, 2),
-        _mm_extract_epi8(x, 3),
-        _mm_extract_epi8(x, 4),
-        _mm_extract_epi8(x, 5),
-        _mm_extract_epi8(x, 6),
-        _mm_extract_epi8(x, 7),
-        _mm_extract_epi8(x, 8),
-        _mm_extract_epi8(x, 9),
-        _mm_extract_epi8(x, 10),
-        _mm_extract_epi8(x, 11),
-        _mm_extract_epi8(x, 12),
-        _mm_extract_epi8(x, 13),
-        _mm_extract_epi8(x, 14),
-        _mm_extract_epi8(x, 15),
-    );
-}
-
-const unsafe fn create_ctrl_mask(x: u32, y: u32, z: u32, w: u32) -> [f32; 4] {
-    union Transmute<T: Copy, U: Copy> {
-        from: T,
-        to: U,
-    }
-    [
-        Transmute {
-            from: x.swap_bytes(),
-        }
-        .to,
-        Transmute {
-            from: y.swap_bytes(),
-        }
-        .to,
-        Transmute {
-            from: z.swap_bytes(),
-        }
-        .to,
-        Transmute {
-            from: w.swap_bytes(),
-        }
-        .to,
-    ]
-}
-
-const unsafe fn create_mask(x: u32, y: u32, z: u32, w: u32) -> [f32; 4] {
-    union Transmute<T: Copy, U: Copy> {
-        from: T,
-        to: U,
-    }
-    [
-        Transmute {
-            from: x * std::u32::MAX,
-        }
-        .to,
-        Transmute {
-            from: y * std::u32::MAX,
-        }
-        .to,
-        Transmute {
-            from: z * std::u32::MAX,
-        }
-        .to,
-        Transmute {
-            from: w * std::u32::MAX,
-        }
-        .to,
-    ]
-}
-
-const PACK_LEFT_MASKS: Aligned<A16, [[[f32; 4]; 2]; 16]> = unsafe {
+const LUT_INDICES: Aligned<A16, [[u32; 4]; 16]> = {
     Aligned([
-        //0000 .... 0 0 0 0
-        [create_mask(0, 0, 0, 0), create_mask(0, 0, 0, 0)],
-        // 0001 X... 0 0 0 0
-        [create_mask(0, 0, 0, 0), create_mask(0, 0, 0, 0)],
-        // 0010 Y... 0 1 0 0
-        [create_mask(1, 0, 0, 0), create_mask(0, 0, 0, 0)],
-        // 0011 XY.. 0 0 0 0
-        [create_mask(0, 0, 0, 0), create_mask(0, 0, 0, 0)],
-        // 0100 Z... 0 0 2 0
-        [create_mask(0, 0, 0, 0), create_mask(1, 0, 0, 0)],
-        // 0101 XZ.. 0 0 1 0
-        [create_mask(0, 1, 0, 0), create_mask(0, 0, 0, 0)],
-        // 0110 YZ.. 0 1 1 0
-        [create_mask(1, 1, 0, 0), create_mask(0, 0, 0, 0)],
-        // 0111 XYZ. 0 0 0 0
-        [create_mask(0, 0, 0, 0), create_mask(0, 0, 0, 0)],
-        // 1000 W... 0 0 0 3
-        [create_mask(0, 0, 0, 0), create_mask(1, 0, 0, 0)],
-        // 1001 XW.. 0 0 0 2
-        [create_mask(0, 0, 0, 0), create_mask(0, 1, 0, 0)],
-        // 1010 YW.. 0 1 0 2
-        [create_mask(1, 0, 0, 0), create_mask(0, 1, 0, 0)],
-        // 1011 XYW. 0 0 0 1
-        [create_mask(0, 0, 1, 0), create_mask(0, 0, 0, 0)],
-        // 1100 ZW.. 0 0 2 2
-        [create_mask(0, 0, 0, 0), create_mask(1, 1, 0, 0)],
-        // 1101 XZW. 0 0 1 1
-        [create_mask(0, 1, 1, 0), create_mask(0, 0, 0, 0)],
-        // 1110 YZW. 0 1 1 1
-        [create_mask(1, 1, 1, 0), create_mask(0, 0, 0, 0)],
-        // 1111 XYZW 0 0 0 0
-        [create_mask(0, 0, 0, 0), create_mask(0, 0, 0, 0)],
+        [0, 0, 0, 0], // 0000 .... 0 0 0 0
+        [0, 0, 0, 0], // 0001 X... 0 0 0 0
+        [1, 0, 0, 0], // 0010 Y... 0 1 0 0
+        [0, 1, 0, 0], // 0011 XY.. 0 0 0 0
+        [2, 0, 0, 0], // 0100 Z... 0 0 2 0
+        [0, 2, 0, 0], // 0101 XZ.. 0 0 1 0
+        [1, 2, 0, 0], // 0110 YZ.. 0 1 1 0
+        [0, 1, 2, 0], // 0111 XYZ. 0 0 0 0
+        [3, 0, 0, 0], // 1000 W... 0 0 0 3
+        [0, 3, 0, 0], // 1001 XW.. 0 0 0 2
+        [1, 3, 0, 0], // 1010 YW.. 0 1 0 2
+        [0, 1, 3, 0], // 1011 XYW. 0 0 0 1
+        [2, 3, 0, 0], // 1100 ZW.. 0 0 2 2
+        [0, 2, 3, 0], // 1101 XZW. 0 0 1 1
+        [1, 2, 3, 0], // 1110 YZW. 0 1 1 1
+        [0, 1, 2, 3], // 1111 XYZW 0 0 0 0
     ])
 };
 
-unsafe fn pack_left_sse2(valid: i32, val: __m128) -> __m128 {
-    let mask0: __m128 = _mm_load_ps(&PACK_LEFT_MASKS[valid as usize][0] as *const f32);
-    let mask1: __m128 = _mm_load_ps(&PACK_LEFT_MASKS[valid as usize][1] as *const f32);
-    let s0: __m128 = _mm_shuffle_ps(val, val, _MM_SHUFFLE(0, 3, 2, 1) as u32);
-    let r0: __m128 = _mm_or_ps(_mm_and_ps(mask0, s0), _mm_andnot_ps(mask0, val));
-    let s1: __m128 = _mm_shuffle_ps(r0, r0, _MM_SHUFFLE(1, 0, 3, 2) as u32);
-    let r1: __m128 = _mm_or_ps(_mm_and_ps(mask1, s1), _mm_andnot_ps(mask1, r0));
-    r1
-}
-const PACK_LEFT_MASKS_SSSE3: Aligned<A16, [[f32; 4]; 16]> = unsafe {
+// NOTE: I'm not sure what primitive size fits here best, but clearly u8 is worse
+const LUT_POPCNT: Aligned<A16, [u16; 16]> = {
     Aligned([
-        // 0000 .... 0 0 0 0
-        create_ctrl_mask(0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F),
-        // 0001 X... 0 0 0 0
-        create_ctrl_mask(0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F),
-        // 0010 Y... 0 1 0 0
-        create_ctrl_mask(0x04050607, 0x80808080, 0x80808080, 0x80808080),
-        // 0011 XY.. 0 0 0 0
-        create_ctrl_mask(0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F),
-        // 0100 Z... 0 0 2 0
-        create_ctrl_mask(0x08090A0B, 0x80808080, 0x80808080, 0x80808080),
-        // 0101 XZ.. 0 0 1 0
-        create_ctrl_mask(0x00010203, 0x08090A0B, 0x80808080, 0x80808080),
-        // 0110 YZ.. 0 1 1 0
-        create_ctrl_mask(0x04050607, 0x08090A0B, 0x80808080, 0x80808080),
-        // 0111 XYZ. 0 0 0 0
-        create_ctrl_mask(0x00010203, 0x04050607, 0x08090A0B, 0x80808080),
-        // 1000 W... 0 0 0 3
-        create_ctrl_mask(0x0C0D0E0F, 0x80808080, 0x80808080, 0x80808080),
-        // 1001 XW.. 0 0 0 2
-        create_ctrl_mask(0x00010203, 0x0C0D0E0F, 0x80808080, 0x80808080),
-        // 1010 YW.. 0 1 0 2
-        create_ctrl_mask(0x04050607, 0x0C0D0E0F, 0x80808080, 0x80808080),
-        // 1011 XYW. 0 0 0 1
-        create_ctrl_mask(0x00010203, 0x04050607, 0x0C0D0E0F, 0x80808080),
-        // 1100 ZW.. 0 0 2 2
-        create_ctrl_mask(0x08090A0B, 0x0C0D0E0F, 0x80808080, 0x80808080),
-        // 1101 XZW. 0 0 1 1
-        create_ctrl_mask(0x00010203, 0x08090A0B, 0x0C0D0E0F, 0x80808080),
-        // 1110 YZW. 0 1 1 1
-        create_ctrl_mask(0x04050607, 0x08090A0B, 0x0C0D0E0F, 0x80808080),
-        // 1111 XYZW 0 0 0 0
-        create_ctrl_mask(0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F),
-    ])
-};
-
-const LUT_INDICES: Aligned<A16, [[f32; 4]; 16]> = unsafe {
-    Aligned([
-        // 0000 .... 0 0 0 0
-        create_ctrl_mask(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-        // 0001 X... 0 0 0 0
-        create_ctrl_mask(0x00000000, 0x00000000, 0x00000000, 0x00000000),
-        // 0010 Y... 0 1 0 0
-        create_ctrl_mask(0x01000000, 0x00000000, 0x00000000, 0x00000000),
-        // 0011 XY.. 0 0 0 0
-        create_ctrl_mask(0x00000000, 0x01000000, 0x00000000, 0x00000000),
-        // 0100 Z... 0 0 2 0
-        create_ctrl_mask(0x02000000, 0x00000000, 0x00000000, 0x00000000),
-        // 0101 XZ.. 0 0 1 0
-        create_ctrl_mask(0x00000000, 0x02000000, 0x00000000, 0x00000000),
-        // 0110 YZ.. 0 1 1 0
-        create_ctrl_mask(0x01000000, 0x02000000, 0x00000000, 0x00000000),
-        // 0111 XYZ. 0 0 0 0
-        create_ctrl_mask(0x00000000, 0x01000000, 0x02000000, 0x00000000),
-        // 1000 W... 0 0 0 3
-        create_ctrl_mask(0x03000000, 0x00000000, 0x00000000, 0x00000000),
-        // 1001 XW.. 0 0 0 2
-        create_ctrl_mask(0x00000000, 0x03000000, 0x00000000, 0x00000000),
-        // 1010 YW.. 0 1 0 2
-        create_ctrl_mask(0x01000000, 0x03000000, 0x00000000, 0x00000000),
-        // 1011 XYW. 0 0 0 1
-        create_ctrl_mask(0x00000000, 0x01000000, 0x03000000, 0x00000000),
-        // 1100 ZW.. 0 0 2 2
-        create_ctrl_mask(0x02000000, 0x03000000, 0x00000000, 0x00000000),
-        // 1101 XZW. 0 0 1 1
-        create_ctrl_mask(0x00000000, 0x02000000, 0x03000000, 0x00000000),
-        // 1110 YZW. 0 1 1 1
-        create_ctrl_mask(0x01000000, 0x02000000, 0x03000000, 0x00000000),
-        // 1111 XYZW 0 0 0 0
-        create_ctrl_mask(0x00000000, 0x01000000, 0x02000000, 0x03000000),
-    ])
-};
-
-const LUT_POPCNT: Aligned<A16, [usize; 16]> = {
-    Aligned([
-        // 0000 .... 0 0 0 0
-        0, // 0001 X... 0 0 0 0
+        0, // 0000 .... 0 0 0 0
+        1, // 0001 X... 0 0 0 0
         1, // 0010 Y... 0 1 0 0
-        1, // 0011 XY.. 0 0 0 0
-        2, // 0100 Z... 0 0 2 0
-        1, // 0101 XZ.. 0 0 1 0
+        2, // 0011 XY.. 0 0 0 0
+        1, // 0100 Z... 0 0 2 0
+        2, // 0101 XZ.. 0 0 1 0
         2, // 0110 YZ.. 0 1 1 0
-        2, // 0111 XYZ. 0 0 0 0
-        3, // 1000 W... 0 0 0 3
-        1, // 1001 XW.. 0 0 0 2
+        3, // 0111 XYZ. 0 0 0 0
+        1, // 1000 W... 0 0 0 3
+        2, // 1001 XW.. 0 0 0 2
         2, // 1010 YW.. 0 1 0 2
-        2, // 1011 XYW. 0 0 0 1
-        3, // 1100 ZW.. 0 0 2 2
-        2, // 1101 XZW. 0 0 1 1
+        3, // 1011 XYW. 0 0 0 1
+        2, // 1100 ZW.. 0 0 2 2
+        3, // 1101 XZW. 0 0 1 1
         3, // 1110 YZW. 0 1 1 1
-        3, // 1111 XYZW 0 0 0 0
-        4,
+        4, // 1111 XYZW 0 0 0 0
     ])
 };
 
-#[inline]
-#[cfg(target_feature = "ssse3")]
-unsafe fn pack_left_ssse3(mask: i32, val: __m128) -> __m128i {
-    // Select shuffle control data
-    let shuf_ctrl: __m128i =
-        _mm_load_si128(std::mem::transmute(&PACK_LEFT_MASKS_SSSE3[mask as usize]));
-    // Permute to move valid values to front of SIMD register
-    let packed: __m128i = _mm_shuffle_epi8(_mm_castps_si128(val), shuf_ctrl);
-    return packed;
+#[inline(always)]
+unsafe fn lookup_index(mask: u16) -> __m128i {
+    _mm_load_si128(LUT_INDICES.as_ptr().offset(mask as isize) as _)
 }
 
-#[inline]
-#[cfg(target_feature = "ssse3")]
-unsafe fn lookup_index(mask: i32) -> __m128i {
-    _mm_load_si128(std::mem::transmute(&LUT_INDICES[mask as usize]))
-}
-
-#[cfg(target_feature = "ssse3")]
-#[inline(never)]
-unsafe fn bitmap_decode_ssse3(bitmap: &[u64], out: &mut Vec<u32>) -> usize {
+unsafe fn bitmap_decode_sse2<'a, I, O>(bitmap: I, offsets: O, out: &mut Vec<u32>) -> usize
+where
+    I: IntoIterator<Item = &'a u64>,
+    I::IntoIter: ExactSizeIterator,
+    O: IntoIterator<Item = u32>,
+{
     let mut out_pos = 0;
-    let mut base: __m128i = _mm_set1_epi32(0);
-    let post_shuffle_mask = _mm_set_epi8(
-        -128i8, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01, -128i8, 0x40, 0x20, 0x10, 0x08, 0x04,
-        0x02, 0x01,
-    );
-    let element_indices = _mm_set_epi8(
-        0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
-        0x0,
-    );
-    let shuffle_mask_a = _mm_set_epi8(
-        -128i8, -128i8, -128i8, 0x03, -128i8, -128i8, -128i8, 0x02, -128i8, -128i8, -128i8, 0x01,
-        -128i8, -128i8, -128i8, 0x00,
-    );
-    let shuffle_mask_b = _mm_set_epi8(
-        -128i8, -128i8, -128i8, 0x07, -128i8, -128i8, -128i8, 0x06, -128i8, -128i8, -128i8, 0x05,
-        -128i8, -128i8, -128i8, 0x04,
-    );
-    let shuffle_mask_c = _mm_set_epi8(
-        -128i8, -128i8, -128i8, 0x0B, -128i8, -128i8, -128i8, 0x0A, -128i8, -128i8, -128i8, 0x09,
-        -128i8, -128i8, -128i8, 0x08,
-    );
-    let shuffle_mask_d = _mm_set_epi8(
-        -128i8, -128i8, -128i8, 0x0F, -128i8, -128i8, -128i8, 0x0E, -128i8, -128i8, -128i8, 0x0D,
-        -128i8, -128i8, -128i8, 0x0C,
-    );
-    let lohi_mask = _mm_set_epi32(0, 0, -1i32, -1i32);
-    let zero_mask = _mm_castsi128_ps(_mm_set1_epi32(0));
+
+    let bitmap_iter = bitmap.into_iter();
+    let mut offset_iter = offsets.into_iter();
+
     // reserve space in the out vec
-    out.reserve(bitmap.len() * 64);
-    for &bits in bitmap {
+    out.clear();
+    out.reserve(bitmap_iter.len() * 64);
+    for &bits in bitmap_iter {
+        let offset = offset_iter.next().unwrap();
         if bits == 0 {
             continue;
         }
+        let mut base: __m128i = _mm_set1_epi32(offset as i32);
+
         for i in 0..4 {
-            // broadcast the bits to all elements
-            let truncated_bits = (bits >> (i * 16)) as i32;
-            let high_bits = truncated_bits as i8;
-            let low_bits = (truncated_bits >> 8) as i8;
-            let mut x: __m128i = _mm_and_si128(_mm_set1_epi8(high_bits), lohi_mask);
-            x = _mm_or_si128(x, _mm_andnot_si128(lohi_mask, _mm_set1_epi8(low_bits)));
+            let move_mask = (bits >> (i * 16)) as u16;
 
-            // print_bytes_u8("mask", post_shuffle_mask);
-            // print_bytes_u8("pre-mask", x);
-
-            // save only the relevant bit per 8 bit integer
-            x = _mm_and_si128(x, post_shuffle_mask);
-            // print_bytes_u8("post-mask", x);
-            // fill the whole integer with FF if the relevant bit is set
-            let mask = _mm_cmpeq_epi8(x, post_shuffle_mask);
-            // cut away the irrelevant bits, leaving the element indices
-            x = _mm_and_si128(mask, element_indices);
-            // println!("bits {:b}", ((bits >> (i * 16)) & 0xFFFF) as i32);
-            // print_bytes_u8("element indices", x);
-
-            // let mut a = _mm_shuffle_epi8(x, shuffle_mask_a);
-            // let mut b = _mm_shuffle_epi8(x, shuffle_mask_b);
-            // let mut c = _mm_shuffle_epi8(x, shuffle_mask_c);
-            // let mut d = _mm_shuffle_epi8(x, shuffle_mask_d);
-            // print_bytes("post-shuffle a", a);
-            // print_bytes("post-shuffle b", b);
-            // print_bytes("post-shuffle c", c);
-            // print_bytes("post-shuffle d", d);
-            // get a move mask from thej element mask
-            let move_mask = truncated_bits;
-            // println!("move mask {:0>16b}", move_mask);
             // pack the elements to the left using the move mask
             let movemask_a = move_mask & 0xF;
             let movemask_b = (move_mask >> 4) & 0xF;
@@ -364,58 +238,42 @@ unsafe fn bitmap_decode_ssse3(bitmap: &[u64], out: &mut Vec<u32>) -> usize {
             let mut c = lookup_index(movemask_c);
             let mut d = lookup_index(movemask_d);
 
-            // print_bytes("indices a", a);
-            // print_bytes("indices b", b);
-            // print_bytes("indices c", c);
-            // print_bytes("indices d", d);
-
             // offset by bit index
             a = _mm_add_epi32(base, a);
             b = _mm_add_epi32(base, b);
             c = _mm_add_epi32(base, c);
             d = _mm_add_epi32(base, d);
-            // lookup offset
+            base = _mm_add_epi32(base, _mm_set1_epi32(16));
+
+            // correct lookups
             b = _mm_add_epi32(_mm_set1_epi32(4), b);
             c = _mm_add_epi32(_mm_set1_epi32(8), c);
             d = _mm_add_epi32(_mm_set1_epi32(12), d);
 
-            // let a_out = pack_left_ssse3(movemask_a, _mm_castsi128_ps(a));
-            // let b_out = pack_left_ssse3(movemask_b, _mm_castsi128_ps(b));
-            // let c_out = pack_left_ssse3(movemask_d, _mm_castsi128_ps(c));
-            // let d_out = pack_left_ssse3(movemask_d, _mm_castsi128_ps(d));
             let a_out = a;
             let b_out = b;
             let c_out = c;
             let d_out = d;
-            // println!("movemask a {:b}", movemask_a);
-            // println!("movemask b {:b}", movemask_b);
-            // println!("movemask c {:b}", movemask_c);
-            // println!("movemask d {:b}", movemask_d);
-            // print_bytes("leftpacked a", a_out);
-            // print_bytes("leftpacked b", b_out);
-            // print_bytes("leftpacked c", c_out);
-            // print_bytes("leftpacked d", d_out);
 
             // get the number of elements being output
-            // let advance_a = _popcnt32(movemask_a) as usize;
-            // let advance_b = _popcnt32(movemask_b) as usize;
-            // let advance_c = _popcnt32(movemask_c) as usize;
-            // let advance_d = _popcnt32(movemask_d) as usize;
-            let advance_a = LUT_POPCNT.get_unchecked(movemask_a as usize);
-            let advance_b = LUT_POPCNT.get_unchecked(movemask_b as usize);
-            let advance_c = LUT_POPCNT.get_unchecked(movemask_c as usize);
-            let advance_d = LUT_POPCNT.get_unchecked(movemask_d as usize);
+            let adv_a = LUT_POPCNT.get_unchecked(movemask_a as usize);
+            let adv_b = LUT_POPCNT.get_unchecked(movemask_b as usize);
+            let adv_c = LUT_POPCNT.get_unchecked(movemask_c as usize);
+            let adv_d = LUT_POPCNT.get_unchecked(movemask_d as usize);
+
+            let adv_ab = adv_a + adv_b;
+            let adv_abc = adv_ab + adv_c;
+            let adv_abcd = adv_abc + adv_d;
+
+            let out_ptr = out.get_unchecked_mut(out_pos) as *mut u32;
+            out_pos += adv_abcd as usize;
+
             // perform the store
-            _mm_storeu_si128(std::mem::transmute(out.get_unchecked(out_pos)), a_out);
-            out_pos += advance_a;
-            _mm_storeu_si128(std::mem::transmute(out.get_unchecked(out_pos)), b_out);
-            out_pos += advance_b;
-            _mm_storeu_si128(std::mem::transmute(out.get_unchecked(out_pos)), c_out);
-            out_pos += advance_c;
-            _mm_storeu_si128(std::mem::transmute(out.get_unchecked(out_pos)), d_out);
-            out_pos += advance_d;
+            _mm_storeu_si128(out_ptr as *mut _, a_out);
+            _mm_storeu_si128(out_ptr.offset(*adv_a as isize) as _, b_out);
+            _mm_storeu_si128(out_ptr.offset(adv_ab as isize) as _, c_out);
+            _mm_storeu_si128(out_ptr.offset(adv_abc as isize) as _, d_out);
             // increase the base
-            base = _mm_add_epi32(base, _mm_set1_epi32(16));
             // println!("to_advance {} pos {} base {}", to_advance, out_pos, _mm_extract_epi32(base, 0));
         }
     }
@@ -423,75 +281,19 @@ unsafe fn bitmap_decode_ssse3(bitmap: &[u64], out: &mut Vec<u32>) -> usize {
     out_pos
 }
 
-unsafe fn bitmap_decode_sse2(bitmap: &[u64], out: &mut Vec<u32>) -> usize {
-    let mut out_pos = 0;
-    let mut base: __m128i = _mm_set1_epi32(0);
-    let post_shuffle_mask = _mm_set_epi32(0x08, 0x04, 0x02, 0x01);
-    let element_indices = _mm_set_epi32(0x03, 0x02, 0x01, 0x0);
-    let zero_mask = _mm_castsi128_ps(_mm_set1_epi32(0));
-    // reserve space in the out vec
-    out.reserve(bitmap.len() * 64);
-    for k in 0..bitmap.len() {
-        let bits = bitmap[k];
-        for i in 0..16 {
-            // broadcast the bits to all elements
-            let mut x: __m128i = _mm_set1_epi32((bits >> (i * 4)) as i32);
-            // save only the relevant bit per 32 bit integer
-            x = _mm_and_si128(x, post_shuffle_mask);
-            // fill the whole integer with FFFFFFFF if the relevant bit is set
-            let mask = _mm_cmpeq_epi32(x, post_shuffle_mask);
-            if _mm_comieq_ss(_mm_castsi128_ps(mask), zero_mask) == 1 {
-                continue;
-            }
-            // cut away the irrelevant bits, leaving the element indices
-            x = _mm_and_si128(mask, element_indices);
-            // offset by bit index
-            x = _mm_add_epi32(base, x);
-            // get a move mask from the element mask
-            let move_mask = _mm_movemask_ps(_mm_castsi128_ps(mask));
-            // pack the elements to the left using the move mask
-            let result = pack_left_sse2(move_mask, _mm_castsi128_ps(x));
-            // get the number of elements being output
-            let to_advance = _popcnt32(move_mask) as usize;
-            // perform the store
-            _mm_storeu_ps(std::mem::transmute(out.get_unchecked(out_pos)), result);
-            // increase the base and output index counters
-            base = _mm_add_epi32(base, _mm_set1_epi32(4));
-            out_pos += to_advance;
-            // println!("to_advance {} pos {} base {}", to_advance, out_pos, _mm_extract_epi32(base, 0));
-        }
-    }
-    out.set_len(out_pos);
-    out_pos
-}
-
-fn bitmap_decode_supernaive(bitmap: &[u64], out: &mut Vec<u32>) -> usize {
+pub fn bitmap_decode_naive<'a, I, O>(bitmap: I, offset: O, out: &mut Vec<u32>) -> usize
+where
+    I: IntoIterator<Item = &'a u64>,
+    I::IntoIter: ExactSizeIterator,
+    O: IntoIterator<Item = u32>,
+{
     let mut pos = 0;
-    out.reserve(bitmap.len() * 64);
-    for k in 0..bitmap.len() {
-        let bitset = bitmap[k];
-        let p = k as u32 * 64;
-        for i in 0..64 {
-            if (bitset >> i) & 0x1 != 0 {
-                unsafe {
-                    *out.get_unchecked_mut(pos) = p + i;
-                }
-                pos += 1;
-            }
-        }
-    }
-    unsafe {
-        out.set_len(pos);
-    }
-    pos
-}
-
-fn bitmap_decode_naive(bitmap: &[u64], out: &mut Vec<u32>) -> usize {
-    let mut pos = 0;
-    out.reserve(bitmap.len() * 64);
-    for k in 0..bitmap.len() {
-        let mut bitset = bitmap[k];
-        let mut p = k as u32 * 64;
+    let bitmap_iter = bitmap.into_iter();
+    out.clear();
+    out.reserve(bitmap_iter.len() * 64);
+    for (&v, offset) in bitmap_iter.zip(offset) {
+        let mut bitset = v;
+        let mut p = offset;
         while bitset != 0 {
             if (bitset & 0x1) != 0 {
                 unsafe {
@@ -503,19 +305,29 @@ fn bitmap_decode_naive(bitmap: &[u64], out: &mut Vec<u32>) -> usize {
             p += 1;
         }
     }
-    return pos;
+    unsafe {
+        out.set_len(pos);
+    }
+    pos
 }
 
-fn bitmap_decode_ctz(bitmap: &[u64], out: &mut Vec<u32>) -> usize {
+pub fn bitmap_decode_ctz<'a, I, O>(bitmap: I, offset: O, out: &mut Vec<u32>) -> usize
+where
+    I: IntoIterator<Item = &'a u64>,
+    I::IntoIter: ExactSizeIterator,
+    O: IntoIterator<Item = u32>,
+{
     let mut pos = 0;
-    out.reserve(bitmap.len() * 64);
-    for k in 0..bitmap.len() {
-        let mut bitset = unsafe { std::mem::transmute::<u64, i64>(bitmap[k]) };
+    let bitmap_iter = bitmap.into_iter();
+    out.clear();
+    out.reserve(bitmap_iter.len() * 64);
+    for (&v, offset) in bitmap_iter.zip(offset) {
+        let mut bitset = unsafe { std::mem::transmute::<u64, i64>(v) };
         while bitset != 0 {
-            let t: i64 = bitset & -bitset;
+            let t: i64 = bitset & bitset.overflowing_neg().0;
             let r = bitset.trailing_zeros();
             unsafe {
-                *out.get_unchecked_mut(pos) = k as u32 * 64 + r;
+                *out.get_unchecked_mut(pos) = r + offset;
             }
             pos += 1;
             bitset ^= t;
@@ -530,170 +342,181 @@ mod tests {
     use test::Bencher;
 
     fn empty_buf() -> Vec<u64> {
-        let mut empty_buf = Vec::new();
-        empty_buf.resize(16384, 0);
-        empty_buf
+        vec![0; 16384]
     }
 
     fn full_buff() -> Vec<u64> {
-        let mut full_buf = Vec::new();
-        full_buf.resize(16384, 0xFFFFFFFFFFFFFFFFu64);
-        full_buf
+        vec![0xFFFFFFFFFFFFFFFFu64; 16384]
+    }
+
+    fn blocky_buf() -> Vec<u64> {
+        use std::iter::repeat;
+
+        // a single long sequence of chains trips up the compiler :/
+        let mut vec: Vec<u64> = repeat(0x5555555555555555u64)
+            .take(1234)
+            .chain(repeat(0u64).take(1000))
+            .chain(repeat(0xFFFFFFFFFFFFFFFFu64).take(500))
+            .chain(repeat(0xbbae187bfcdd3b05u64).take(1234))
+            .chain(repeat(0xd7156e450545b7adu64).take(2456))
+            .chain(repeat(0u64).take(1500))
+            .chain(repeat(0x5555555555555555u64).take(55))
+            .chain(repeat(0u64).take(50))
+            .collect();
+        vec.extend(
+            repeat(0xFF00FF5500330210u64)
+                .take(2500)
+                .chain(repeat(0u64).take(7))
+                .chain(repeat(0x1228b38cf8ef551bu64).take(1500))
+                .chain(repeat(0x5555555555555555u64).take(1156))
+                .chain(repeat(0u64).take(42)),
+        );
+        vec.resize(16384, 0xFFFFFFFF00000000u64);
+
+        vec
     }
 
     fn interleaved_buf() -> Vec<u64> {
-        let mut full_buf = Vec::new();
-        full_buf.resize(16384, 0x5555555555555555u64);
-        full_buf
+        vec![0x5555555555555555u64; 16384]
     }
 
     fn random_num_buf() -> Vec<u64> {
-        let mut full_buf = Vec::new();
-        full_buf.resize(16384, 0xbbae187bfcdd3b05u64);
-        full_buf
+        vec![0xbbae187bfcdd3b05u64; 16384]
     }
 
-    unsafe fn bench_decode(
-        b: &mut Bencher,
-        bitset: &[u64],
-        fun: unsafe fn(&[u64], &mut Vec<u32>) -> usize,
-    ) {
-        let mut values = Vec::with_capacity(bitset.len() * 64);
+    #[test]
+    fn test_sse2_equal_bitset() {
+        // let mut bitmap = vec![0xbbae187b00003b05, 0, 1];
+        // bitmap.resize(64, 0);
+        // bitmap.push(1);
+        let bitmap = blocky_buf();
+        let bitset = BitSet::from_level0(bitmap.clone());
+
+        let mut sse2_values = Vec::with_capacity(bitmap.len() * 64);
+        Sse2Decoder::decode(&bitmap, (0..).step_by(64), &mut sse2_values);
+        let mut buf1 = Vec::new();
+        let mut buf2 = Vec::new();
+
+        assert_eq!(
+            sse2_values,
+            bitset
+                .iter::<Sse2Decoder>(&mut buf1, &mut buf2)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_sse2_equal_naive() {
+        let bitmap = vec![0xbbae187b00003b05u64; 10];
+
+        let mut naive_values = Vec::with_capacity(bitmap.len() * 64);
+        let mut sse2_values = Vec::with_capacity(bitmap.len() * 64);
+        let naive_len = NaiveDecoder::decode(&bitmap, (0..).step_by(64), &mut naive_values);
+        let sse2_len = Sse2Decoder::decode(&bitmap, (0..).step_by(64), &mut sse2_values);
+        assert_eq!(naive_len, sse2_len);
+        assert_eq!(naive_values, sse2_values);
+    }
+
+    fn bench_decode<D: Decoder>(b: &mut Bencher, bitmap: &[u64]) {
+        let mut values = Vec::with_capacity(bitmap.len() * 64);
         b.iter(|| {
             values.clear();
-            fun(&bitset, &mut values);
+            test::black_box(D::decode(
+                test::black_box(bitmap),
+                (0..).step_by(64),
+                &mut values,
+            ));
         })
     }
 
-    // #[bench]
-    // fn bench_sse2_empty(b: &mut Bencher) {
-    //     unsafe {
-    //         bench_decode(b, &empty_buf(), bitmap_decode_sse2);
-    //     }
-    // }
-    // #[bench]
-    // fn bench_sse2_full(b: &mut Bencher) {
-    //     unsafe {
-    //         bench_decode(b, &full_buff(), bitmap_decode_sse2);
-    //     }
-    // }
-    // #[bench]
-    // fn bench_sse2_test(b: &mut Bencher) {
-    //     unsafe {
-    //         bench_decode(b, &VEC_DECODE_TABLE, bitmap_decode_sse2);
-    //     }
-    // }
-
-    #[bench]
-    fn bench_ssse3_empty(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &empty_buf(), bitmap_decode_ssse3);
-        }
-    }
-    #[bench]
-    fn bench_ssse3_full(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &full_buff(), bitmap_decode_ssse3);
-        }
-    }
-    #[bench]
-    fn bench_ssse3_test(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &VEC_DECODE_TABLE, bitmap_decode_ssse3);
-        }
-    }
-    #[bench]
-    fn bench_ssse3_interleaved(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &interleaved_buf(), bitmap_decode_ssse3);
-        }
-    }
-    #[bench]
-    fn bench_ssse3_random(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &random_num_buf(), bitmap_decode_ssse3);
-        }
+    fn bench_bitset<D: Decoder>(b: &mut Bencher, bitmap: &[u64]) {
+        let mut values = Vec::with_capacity(bitmap.len() * 64);
+        let bitset = BitSet::from_level0(bitmap.iter().cloned().collect());
+        let mut buf1 = Vec::new();
+        let mut buf2 = Vec::new();
+        b.iter(|| {
+            values.clear();
+            test::black_box(values.extend(bitset.iter::<D>(&mut buf1, &mut buf2)));
+        })
     }
 
+    #[bench]
+    fn bench_sse2_empty(b: &mut Bencher) {
+        bench_decode::<Sse2Decoder>(b, &empty_buf());
+    }
+    #[bench]
+    fn bench_sse2_full(b: &mut Bencher) {
+        bench_decode::<Sse2Decoder>(b, &full_buff());
+    }
+    #[bench]
+    fn bench_sse2_test(b: &mut Bencher) {
+        bench_decode::<Sse2Decoder>(b, &VEC_DECODE_TABLE);
+    }
+    #[bench]
+    fn bench_sse2_interleaved(b: &mut Bencher) {
+        bench_decode::<Sse2Decoder>(b, &interleaved_buf());
+    }
+    #[bench]
+    fn bench_sse2_random(b: &mut Bencher) {
+        bench_decode::<Sse2Decoder>(b, &random_num_buf());
+    }
+    #[bench]
+    fn bench_sse2_blocky(b: &mut Bencher) {
+        bench_decode::<Sse2Decoder>(b, &blocky_buf());
+    }
+    #[bench]
+    fn bench_sse2_blocky_bitset(b: &mut Bencher) {
+        bench_bitset::<Sse2Decoder>(b, &blocky_buf());
+    }
     #[bench]
     fn bench_naive_empty(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &empty_buf(), bitmap_decode_naive);
-        }
+        bench_decode::<NaiveDecoder>(b, &empty_buf());
     }
     #[bench]
     fn bench_naive_full(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &full_buff(), bitmap_decode_naive);
-        }
+        bench_decode::<NaiveDecoder>(b, &full_buff());
     }
     #[bench]
     fn bench_naive_test(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &VEC_DECODE_TABLE, bitmap_decode_naive);
-        }
+        bench_decode::<NaiveDecoder>(b, &VEC_DECODE_TABLE);
     }
     #[bench]
     fn bench_naive_interleaved(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &interleaved_buf(), bitmap_decode_naive);
-        }
+        bench_decode::<NaiveDecoder>(b, &interleaved_buf());
     }
     #[bench]
     fn bench_naive_random(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &random_num_buf(), bitmap_decode_naive);
-        }
+        bench_decode::<NaiveDecoder>(b, &random_num_buf());
+    }
+    #[bench]
+    fn bench_naive_blocky(b: &mut Bencher) {
+        bench_decode::<NaiveDecoder>(b, &blocky_buf());
     }
 
     #[bench]
     fn bench_ctz_empty(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &empty_buf(), bitmap_decode_ctz);
-        }
+        bench_decode::<CtzDecoder>(b, &empty_buf());
     }
     #[bench]
     fn bench_ctz_full(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &full_buff(), bitmap_decode_ctz);
-        }
+        bench_decode::<CtzDecoder>(b, &full_buff());
     }
     #[bench]
     fn bench_ctz_test(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &VEC_DECODE_TABLE, bitmap_decode_ctz);
-        }
+        bench_decode::<CtzDecoder>(b, &VEC_DECODE_TABLE);
     }
     #[bench]
     fn bench_ctz_interleaved(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &interleaved_buf(), bitmap_decode_ctz);
-        }
+        bench_decode::<CtzDecoder>(b, &interleaved_buf());
     }
     #[bench]
     fn bench_ctz_random(b: &mut Bencher) {
-        unsafe {
-            bench_decode(b, &random_num_buf(), bitmap_decode_ctz);
-        }
+        bench_decode::<CtzDecoder>(b, &random_num_buf());
     }
-    // static uint8_t lengthTable[256] = {
-    //     0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
-    //     1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
-    //     1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
-    //     2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-    //     1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
-    //     2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-    //     2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-    //     3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
-    //     1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
-    //     2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-    //     2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-    //     3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
-    //     2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-    //     3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
-    //     3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
-    //     4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8
-    // };
+    #[bench]
+    fn bench_ctz_blocky(b: &mut Bencher) {
+        bench_decode::<CtzDecoder>(b, &blocky_buf());
+    }
 
     const VEC_DECODE_TABLE: [u64; 106] = [
         0x00010203, 0x04050607, 0x08090A0B, 0x0C, 0x0D, 0x0E, 0x0F101112, 0x13141516, 0x1718191A,
