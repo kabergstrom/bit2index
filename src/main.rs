@@ -16,6 +16,16 @@ pub struct BitSet {
     level0: Vec<u64>,
 }
 
+#[inline(never)]
+pub fn bitset_collect_old(bitset: &BitSet) -> Vec<u32> {
+    bitset.iter().collect()
+}
+
+#[inline(never)]
+pub fn bitset_collect_sse2(bitset: &BitSet) -> Vec<u32> {
+    bitset.decode_iter::<Sse2Decoder>().collect()
+}
+
 fn next_layer(data: &[u64]) -> Vec<u64> {
     data.chunks(BITS_PER_PRIM)
         .map(|chunk| {
@@ -53,14 +63,15 @@ impl<T: BitSetLike> IntoDecodeIter for T {
     // NOTE: The key here is obviously getting rid of vec allocations/clones.
     // This is obviously hard due to borrowing rules. I was able to reduce it to
     // one clone per chunk by providing buffers from outside.
+    #[inline(always)]
     fn decode_iter<'a, D: Decoder>(&'a self) -> BitSetIter<'a, D, Self> {
         BitSetIter::<D, Self>::new(self)
     }
 }
 
 const LEVEL2_BATCH: usize = 16;
-const LEVEL1_BATCH: usize = 4;
-const LEVEL0_BATCH: usize = 4;
+const LEVEL1_BATCH: usize = 8;
+const LEVEL0_BATCH: usize = 24;
 
 impl BitSetLike for BitSet {
     fn layer3(&self) -> usize {
@@ -155,6 +166,7 @@ impl<'a, D: Decoder, B: BitSetLike + 'a> BitSetIter<'a, D, B> {
 
 impl<'a, D: Decoder, B: BitSetLike> Iterator for BitSetIter<'a, D, B> {
     type Item = u32;
+    #[inline(always)]
     fn next(&mut self) -> Option<u32> {
         if self.level0_len == 0 {
             return None;
@@ -292,9 +304,11 @@ fn main() {
     // let mut out = Vec::new();
     // bitmap_decode_naive(&values, &mut out);
 
-    let out: Vec<_> = BitSet::from_level0(bitmap.clone())
-        .decode_iter::<Sse2Decoder>()
-        .collect();
+    let bitset = BitSet::from_level0(bitmap.clone());
+    bitset_collect_sse2(&bitset);
+    bitset_collect_old(&bitset);
+
+    let out: Vec<_> = bitset.decode_iter::<Sse2Decoder>().collect();
     println!("{:b} -- {:?}", bitmap[0], out);
 }
 
@@ -372,9 +386,10 @@ where
 
     for bits in bitmap_iter {
         let offset = offset_iter.next().unwrap();
-        // if bits == 0 {
-        //     continue;
-        // }
+        if bits == 0 {
+            continue;
+        }
+
         let mut base: __m128i = _mm_set1_epi32(offset as i32);
 
         for i in 0..4 {
@@ -396,7 +411,10 @@ where
             b = _mm_add_epi32(base, b);
             c = _mm_add_epi32(base, c);
             d = _mm_add_epi32(base, d);
-            base = _mm_add_epi32(base, _mm_set1_epi32(16));
+            // increase the base
+            if i != 3 {
+                base = _mm_add_epi32(base, _mm_set1_epi32(16));
+            }
 
             // correct lookups
             b = _mm_add_epi32(_mm_set1_epi32(4), b);
@@ -426,13 +444,13 @@ where
             _mm_storeu_si128(out_ptr.offset(*adv_a as isize) as _, b_out);
             _mm_storeu_si128(out_ptr.offset(adv_ab as isize) as _, c_out);
             _mm_storeu_si128(out_ptr.offset(adv_abc as isize) as _, d_out);
-            // increase the base
             // println!("to_advance {} pos {} base {}", to_advance, out_pos, _mm_extract_epi32(base, 0));
         }
     }
     out_pos
 }
 
+#[inline(always)]
 pub unsafe fn bitmap_decode_naive<I, O>(bitmap: I, offset: O, out: &mut [u32]) -> usize
 where
     I: IntoIterator<Item = u64>,
