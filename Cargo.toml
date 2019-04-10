@@ -1,9 +1,9 @@
 [package]
-name = "testproject"
+name = "bit2index"
 version = "0.1.0"
 authors = ["Karl"]
 edition = "2018"
-target-features = ["ssse3"]
+target-features = ["sse2"]
 
 [dependencies]
 aligned = "0.3"
