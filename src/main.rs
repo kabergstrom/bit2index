@@ -97,12 +97,24 @@ impl BitSetLike for BitSet {
     }
 }
 
+fn test_indirect(b: BitSet) {
+    let iter = CoolBitSetIter::new(&b);
+    let values: Vec<u32> = iter.collect();
+    println!("out {:?}", values);
+}
+
+struct IndirectBase {
+    pub input_ptr: *const u64,
+    pub output_ptr: *mut u32,
+    pub output_len: *mut usize,
+    pub output_selector_tag: u32,
+}
+
 // We will produce a maximum of LEVEL2_MAX_GENERATED indices from L2 into the working buffer per batch
 // These indices are used to scan the L1 index and are produced by a straight-forward method.
 const LEVEL2_MAX_GENERATED: usize = 2;
-const WORKING_BUFFER_STORAGE_REQUIRED: usize = BITS_PER_PRIM * LEVEL2_MAX_GENERATED;
-const OUTPUT_BUFFER_STORAGE_REQUIRED: usize =
-    WORKING_BUFFER_STORAGE_REQUIRED * BITS_PER_PRIM * BITS_PER_PRIM * BITS_PER_PRIM * 4;
+const WORKING_BUFFER_STORAGE_REQUIRED: usize = BITS_PER_PRIM * LEVEL2_MAX_GENERATED + 32;
+const OUTPUT_BUFFER_STORAGE_REQUIRED: usize = WORKING_BUFFER_STORAGE_REQUIRED * BITS_PER_PRIM;
 
 #[repr(align(16))]
 pub struct CoolBitSetIter<'a> {
@@ -111,8 +123,11 @@ pub struct CoolBitSetIter<'a> {
     working_buffer_len: usize,
     output_buffer_len: usize,
     bitset: &'a BitSet,
-    iter_idx: usize,
-    // this is the bit index of level 2
+    // iteration index for the working buffer
+    working_iter_idx: usize,
+    // iteration index for the output buffer
+    output_iter_idx: usize,
+    // iteration bit index of level 2 from the input bitset
     l2_idx: usize,
     // since the iter stores pointers into buffers in the indirect_bases we can't move it
     _pin: std::marker::PhantomPinned,
@@ -126,32 +141,143 @@ impl<'a> CoolBitSetIter<'a> {
             working_buffer_len: 0,
             output_buffer_len: 0,
             bitset: bitset,
-            iter_idx: 0,
+            working_iter_idx: 0,
+            output_iter_idx: 0,
             l2_idx: 0,
             _pin: std::marker::PhantomPinned,
         }
     }
-    unsafe fn bases(this: &mut Self) -> [IndirectBase; 2] {
-        unsafe {
-            [
-                IndirectBase {
-                    input_ptr: this.bitset.level1.get_unchecked(0),
-                    output_ptr: this.working_buffer.get_unchecked_mut(0),
-                    output_len: &mut this.working_buffer_len,
-                    output_selector_tag: 1 << 30,
-                },
-                IndirectBase {
-                    input_ptr: this.bitset.level0.get_unchecked(0),
-                    output_ptr: this.output_buffer.get_unchecked_mut(0),
-                    output_len: &mut this.output_buffer_len,
-                    output_selector_tag: 0,
-                },
-            ]
+    unsafe fn bases(&mut self) -> [IndirectBase; 2] {
+        [
+            IndirectBase {
+                input_ptr: self.bitset.level1.get_unchecked(0),
+                output_ptr: self.working_buffer.get_unchecked_mut(0),
+                output_len: &mut self.working_buffer_len,
+                output_selector_tag: 1 << 30,
+            },
+            IndirectBase {
+                input_ptr: self.bitset.level0.get_unchecked(0),
+                output_ptr: self.output_buffer.get_unchecked_mut(0),
+                output_len: &mut self.output_buffer_len,
+                output_selector_tag: 0,
+            },
+        ]
+    }
+    unsafe fn populate_working_buffer(&mut self) {
+        // reset the working batch
+        self.working_buffer_len = 0;
+        self.working_iter_idx = 0;
+        // produce new indices
+        while self.l2_idx / 64 < self.bitset.level2.len()
+            && self.working_buffer_len < LEVEL2_MAX_GENERATED
+        {
+            let l2_idx_element = self.l2_idx / 64;
+            let mut bitset = self.bitset.layer2(l2_idx_element) as u64;
+            // extract the bit index for the element from the lower 6 bits and create an inverted mask
+            // this mask is used to remove bit indices we have already iterated through
+            bitset = bitset & !((1u64 << (self.l2_idx & 0x3F)).checked_sub(1).unwrap_or(0));
+            while bitset != 0 && self.working_buffer_len < LEVEL2_MAX_GENERATED {
+                let t: u64 = bitset & bitset.overflowing_neg().0;
+                let r = bitset.trailing_zeros();
+                *self
+                    .working_buffer
+                    .get_unchecked_mut(self.working_buffer_len) = r + (l2_idx_element * 64) as u32;
+                self.working_buffer_len += 1;
+                self.l2_idx = (l2_idx_element * 64) + r as usize + 1;
+                bitset ^= t;
+            }
+            if bitset == 0 {
+                self.l2_idx = (l2_idx_element + 1) * 64;
+            }
         }
     }
-    fn output_buffer(&'a self) -> &'a [u32] {
-        unsafe {
-            &std::slice::from_raw_parts(self.output_buffer.get_unchecked(0), self.output_buffer_len)
+
+    // Takes an input array of tagged u32 indices and an array of (input_pointer, output_pointer, output_len, output_selector_tag)
+    // The top 2 bits of a tagged u32 input index is used to select into the indirect_bases array.
+    // The bottom 30 bits of the index is added onto the input_pointer to get a u64 value to be interpreted as a bitmap
+    // For each bit set in the bitmap,
+    // An output u32 index is generated by multiplying the input index by 64, adding the bit index and adding the output_selector_tag.
+    // All output u32 indices are written to the output_pointer of the selected indirect_base offset by its output_len.
+    // The output_len is then increased by the number of output u32 indices.
+    unsafe fn bitmap_decode_sse2_indirect(&mut self) {
+        let mut indirect_bases = self.bases();
+
+        while self.working_iter_idx < self.working_buffer_len {
+            let prefetch_idx = self.working_buffer.get_unchecked(self.working_iter_idx + 4); // the buffer size is bigger than the potential length so we can always safely get future elements
+            let prefetch_base = indirect_bases.get_unchecked_mut((prefetch_idx >> 30) as usize);
+            let prefetch_addr = prefetch_base
+                .input_ptr
+                .offset((prefetch_idx & ((1 << 30) - 1)) as isize);
+            _mm_prefetch(prefetch_addr as *const i8, 0);
+
+            let idx = *self.working_buffer.get_unchecked_mut(self.working_iter_idx);
+            self.working_iter_idx += 1;
+            let indirect_base = indirect_bases.get_unchecked_mut((idx >> 30) as usize); // use the top 2 bits to get which indirect base this index is for
+                                                                                        // Mask away the top 2 bits to get the untagged index
+            let untagged_idx = idx & ((1 << 30) - 1);
+            // offset the input ptr with the untagged index to get the input u64 bitmap
+            let bits = *indirect_base.input_ptr.offset(untagged_idx as isize);
+
+            // Multiply the untagged index by 64 to get the index in the next level of the hierarchy,
+            // then add the output_selector_tag
+            let mut base: __m128i =
+                _mm_set1_epi32(((untagged_idx * 64) | indirect_base.output_selector_tag) as i32);
+
+            for i in 0..4 {
+                let move_mask = (bits >> (i * 16)) as u16;
+
+                // pack the elements to the left using the move mask
+                let movemask_a = move_mask & 0xF;
+                let movemask_b = (move_mask >> 4) & 0xF;
+                let movemask_c = (move_mask >> 8) & 0xF;
+                let movemask_d = (move_mask >> 12) & 0xF;
+
+                let mut a = lookup_index(movemask_a);
+                let mut b = lookup_index(movemask_b);
+                let mut c = lookup_index(movemask_c);
+                let mut d = lookup_index(movemask_d);
+
+                // offset by bit index
+                a = _mm_add_epi32(base, a);
+                b = _mm_add_epi32(base, b);
+                c = _mm_add_epi32(base, c);
+                d = _mm_add_epi32(base, d);
+                // increase the base
+                if i != 3 {
+                    base = _mm_add_epi32(base, _mm_set1_epi32(16));
+                }
+
+                // correct lookups
+                b = _mm_add_epi32(_mm_set1_epi32(4), b);
+                c = _mm_add_epi32(_mm_set1_epi32(8), c);
+                d = _mm_add_epi32(_mm_set1_epi32(12), d);
+
+                let a_out = a;
+                let b_out = b;
+                let c_out = c;
+                let d_out = d;
+
+                // get the number of elements being output
+                let adv_a = LUT_POPCNT.get_unchecked(movemask_a as usize);
+                let adv_b = LUT_POPCNT.get_unchecked(movemask_b as usize);
+                let adv_c = LUT_POPCNT.get_unchecked(movemask_c as usize);
+                let adv_d = LUT_POPCNT.get_unchecked(movemask_d as usize);
+
+                let adv_ab = adv_a + adv_b;
+                let adv_abc = adv_ab + adv_c;
+                let adv_abcd = adv_abc + adv_d;
+
+                let len = *indirect_base.output_len;
+                let out_ptr = indirect_base.output_ptr.offset(len as isize);
+                *indirect_base.output_len += adv_abcd as usize;
+
+                // perform the store
+                _mm_storeu_si128(out_ptr as *mut _, a_out);
+                _mm_storeu_si128(out_ptr.offset(*adv_a as isize) as _, b_out);
+                _mm_storeu_si128(out_ptr.offset(adv_ab as isize) as _, c_out);
+                _mm_storeu_si128(out_ptr.offset(adv_abc as isize) as _, d_out);
+                // println!("to_advance {} pos {} base {}", to_advance, out_pos, _mm_extract_epi32(base, 0));
+            }
         }
     }
 }
@@ -162,44 +288,22 @@ impl<'a> Iterator for CoolBitSetIter<'a> {
     // The return type is `Option<T>`:
     //     * When the `Iterator` is finished, `None` is returned.
     //     * Otherwise, the next value is wrapped in `Some` and returned.
+    #[inline(always)]
     fn next(&mut self) -> Option<u32> {
         unsafe {
-            if self.iter_idx >= self.working_buffer_len {
-                // reset the working batch
-                self.working_buffer_len = 0;
-                self.iter_idx = 0;
-                // produce new indices
-                while self.l2_idx / 64 < self.bitset.level2.len()
-                    && self.working_buffer_len < LEVEL2_MAX_GENERATED
-                {
-                    let l2_idx_element = self.l2_idx / 64;
-                    let mut bitset = self.bitset.layer2(l2_idx_element) as u64;
-                    let pre_bitset = bitset;
-                    // extract the bit index for the element from the lower 6 bits and create an inverted mask
-                    // this mask is used to remove bit indices we have already iterated through
-                    // println!("l2 idx {} shifted {:b}", self.l2_idx & 0x3F, (1 << (self.l2_idx as u64 & 0x3Fu64)) as usize);
-                    bitset = bitset & !((1u64 << (self.l2_idx & 0x3F)).checked_sub(1).unwrap_or(0));
-                    while bitset != 0 && self.working_buffer_len < LEVEL2_MAX_GENERATED {
-                        let t: u64 = bitset & bitset.overflowing_neg().0;
-                        let r = bitset.trailing_zeros();
-                        *self
-                            .working_buffer
-                            .get_unchecked_mut(self.working_buffer_len) =
-                            r + (l2_idx_element * 64) as u32;
-                        self.working_buffer_len += 1;
-                        self.l2_idx = (l2_idx_element * 64) + r as usize + 1;
-                        bitset ^= t;
-                    }
-                    if bitset == 0 {
-                        self.l2_idx = (l2_idx_element + 1) * 64;
+            if self.output_iter_idx >= self.output_buffer_len {
+                if self.working_iter_idx >= self.working_buffer_len {
+                    self.populate_working_buffer();
+                    if self.working_iter_idx >= self.working_buffer_len {
+                        return None;
                     }
                 }
-                if self.iter_idx >= self.working_buffer_len {
-                    return None;
-                }
+                self.output_iter_idx = 0;
+                self.output_buffer_len = 0;
+                self.bitmap_decode_sse2_indirect();
             }
-            let val = *self.working_buffer.get_unchecked(self.iter_idx);
-            self.iter_idx += 1;
+            let val = *self.output_buffer.get_unchecked(self.output_iter_idx);
+            self.output_iter_idx += 1;
             Some(val)
         }
     }
@@ -272,7 +376,6 @@ impl<'a, D: Decoder, B: BitSetLike + 'a> BitSetIter<'a, D, B> {
     }
 }
 
-#[inline(never)]
 unsafe fn populate_buf<'a, D: Decoder, B: BitSetLike>(b: &mut BitSetIter<'a, D, B>) -> usize {
     let bitset = b.bitset;
 
@@ -407,8 +510,8 @@ fn main() {
     // let values = [0xABCDEFu64];
     // let values = [0xFFFFFFFFFFFFFFFFu64];
 
-    // let mut bitmap = vec![0xbbae187b00003b05, 0, 1];
-    let mut bitmap = vec![0xABCDEF];
+    let mut bitmap = vec![0xbbae187b00003b05, 0, 1];
+    // let mut bitmap = vec![0xABCDEF];
     bitmap.resize(64 * 64 - 1, 0);
     bitmap.push(1);
 
@@ -421,9 +524,7 @@ fn main() {
     // bitmap_decode_naive(&values, &mut out);
 
     let bitset = BitSet::from_level0(bitmap.clone());
-    unsafe {
-        test_indirect(bitset);
-    }
+    test_indirect(bitset);
     test_indirect(BitSet::from_level0(interleaved_buf()));
     test_indirect(BitSet::from_level0(random_num_buf()));
     test_indirect(BitSet::from_level0(blocky_buf()));
@@ -491,106 +592,6 @@ const LUT_POPCNT: Aligned<A16, [u16; 16]> = {
 #[inline(always)]
 unsafe fn lookup_index(mask: u16) -> __m128i {
     _mm_load_si128(LUT_INDICES.as_ptr().offset(mask as isize) as _)
-}
-
-fn test_indirect(b: BitSet) -> () {
-    unsafe {
-        let mut iter = CoolBitSetIter::new(&b);
-        let iter_pinned = std::pin::Pin::new_unchecked(&mut iter);
-        bitmap_decode_sse2_indirect(iter_pinned);
-    }
-}
-
-struct IndirectBase {
-    pub input_ptr: *const u64,
-    pub output_ptr: *mut u32,
-    pub output_len: *mut usize,
-    pub output_selector_tag: u32,
-}
-
-// Takes an input array of tagged u32 indices and an array of (input_pointer, output_pointer, output_len, output_selector_tag)
-// The top 2 bits of a tagged u32 input index is used to select into the indirect_bases array.
-// The bottom 30 bits of the index is added onto the input_pointer to get a u64 value to be interpreted as a bitmap
-// For each bit set in the bitmap,
-// An output u32 index is generated by multiplying the input index by 64, adding the bit index and adding the output_selector_tag.
-// All output u32 indices are written to the output_pointer of the selected indirect_base offset by its output_len.
-// The output_len is then increased by the number of output u32 indices.
-unsafe fn bitmap_decode_sse2_indirect(bitmap_iter: std::pin::Pin<&mut CoolBitSetIter>) {
-    let mut bitmap_iter = bitmap_iter.get_unchecked_mut();
-    let mut indirect_bases = CoolBitSetIter::bases(&mut bitmap_iter);
-    // debug_assert!(out.len() >= bitmap_iter.len() * 64);
-
-    for idx in bitmap_iter {
-        let indirect_base = indirect_bases.get_mut((idx >> 30) as usize).unwrap(); // use the top 2 bits to get which indirect base this index is for
-                                                                                   // Mask away the top 2 bits to get the untagged index
-        let untagged_idx = idx & ((1 << 30) - 1);
-        // offset the input ptr with the untagged index to get the input u64 bitmap
-        let bits = *indirect_base.input_ptr.offset(untagged_idx as isize);
-        if bits == 0 {
-            continue;
-        }
-
-        // Multiply the untagged index by 64 to get the index in the next level of the hierarchy,
-        // then add the output_selector_tag
-        let mut base: __m128i =
-            _mm_set1_epi32(((untagged_idx * 64) | indirect_base.output_selector_tag) as i32);
-
-        for i in 0..4 {
-            let move_mask = (bits >> (i * 16)) as u16;
-
-            // pack the elements to the left using the move mask
-            let movemask_a = move_mask & 0xF;
-            let movemask_b = (move_mask >> 4) & 0xF;
-            let movemask_c = (move_mask >> 8) & 0xF;
-            let movemask_d = (move_mask >> 12) & 0xF;
-
-            let mut a = lookup_index(movemask_a);
-            let mut b = lookup_index(movemask_b);
-            let mut c = lookup_index(movemask_c);
-            let mut d = lookup_index(movemask_d);
-
-            // offset by bit index
-            a = _mm_add_epi32(base, a);
-            b = _mm_add_epi32(base, b);
-            c = _mm_add_epi32(base, c);
-            d = _mm_add_epi32(base, d);
-            // increase the base
-            if i != 3 {
-                base = _mm_add_epi32(base, _mm_set1_epi32(16));
-            }
-
-            // correct lookups
-            b = _mm_add_epi32(_mm_set1_epi32(4), b);
-            c = _mm_add_epi32(_mm_set1_epi32(8), c);
-            d = _mm_add_epi32(_mm_set1_epi32(12), d);
-
-            let a_out = a;
-            let b_out = b;
-            let c_out = c;
-            let d_out = d;
-
-            // get the number of elements being output
-            let adv_a = LUT_POPCNT.get_unchecked(movemask_a as usize);
-            let adv_b = LUT_POPCNT.get_unchecked(movemask_b as usize);
-            let adv_c = LUT_POPCNT.get_unchecked(movemask_c as usize);
-            let adv_d = LUT_POPCNT.get_unchecked(movemask_d as usize);
-
-            let adv_ab = adv_a + adv_b;
-            let adv_abc = adv_ab + adv_c;
-            let adv_abcd = adv_abc + adv_d;
-
-            let len = *indirect_base.output_len;
-            let out_ptr = indirect_base.output_ptr.offset(len as isize);
-            *indirect_base.output_len += adv_abcd as usize;
-
-            // perform the store
-            _mm_storeu_si128(out_ptr as *mut _, a_out);
-            _mm_storeu_si128(out_ptr.offset(*adv_a as isize) as _, b_out);
-            _mm_storeu_si128(out_ptr.offset(adv_ab as isize) as _, c_out);
-            _mm_storeu_si128(out_ptr.offset(adv_abc as isize) as _, d_out);
-            // println!("to_advance {} pos {} base {}", to_advance, out_pos, _mm_extract_epi32(base, 0));
-        }
-    }
 }
 
 unsafe fn bitmap_decode_sse2<I, O>(bitmap: I, offsets: O, out: &mut [u32]) -> usize
@@ -822,14 +823,20 @@ mod tests {
     }
 
     fn bench_bitset<D: Decoder>(b: &mut Bencher, bitmap: &[u64]) {
-        let mut values = Vec::with_capacity(bitmap.len() * BITS_PER_PRIM);
         let bitset_conv = BitSet::from_level0(bitmap.iter().cloned().collect());
         let mut hibitset = hibitset::BitSet::new();
         hibitset.extend(bitset_conv.iter());
 
         b.iter(|| {
-            values.clear();
-            test::black_box(values.extend(hibitset.decode_iter::<D>()));
+            test::black_box(hibitset.decode_iter::<D>().count());
+        })
+    }
+
+    fn bench_indirect(b: &mut Bencher, bitmap: &[u64]) {
+        let bitset = BitSet::from_level0(bitmap.iter().cloned().collect());
+
+        b.iter(|| {
+            test::black_box(CoolBitSetIter::new(&bitset).count());
         })
     }
 
@@ -1008,24 +1015,28 @@ mod tests {
         bench_decode::<CtzDecoder>(b, &blocky_buf());
     }
     #[bench]
+    fn bench_indirect_empty(b: &mut Bencher) {
+        bench_indirect(b, &empty_buf());
+    }
+    #[bench]
     fn bench_indirect_full(b: &mut Bencher) {
-        test_indirect(BitSet::from_level0(full_buff()));
+        bench_indirect(b, &full_buff());
     }
     #[bench]
     fn bench_indirect_test(b: &mut Bencher) {
-        // test_indirect(BitSet::from_level0(VEC_DECODE_TABLE));
+        bench_indirect(b, &VEC_DECODE_TABLE);
     }
     #[bench]
     fn bench_indirect_interleaved(b: &mut Bencher) {
-        test_indirect(BitSet::from_level0(interleaved_buf()));
+        bench_indirect(b, &interleaved_buf());
     }
     #[bench]
     fn bench_indirect_random(b: &mut Bencher) {
-        test_indirect(BitSet::from_level0(random_num_buf()));
+        bench_indirect(b, &random_num_buf());
     }
     #[bench]
     fn bench_indirect_blocky(b: &mut Bencher) {
-        test_indirect(BitSet::from_level0(blocky_buf()));
+        bench_indirect(b, &blocky_buf());
     }
 
     const VEC_DECODE_TABLE: [u64; 106] = [
