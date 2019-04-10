@@ -97,6 +97,111 @@ impl BitSetLike for BitSet {
     }
 }
 
+// We will produce a maximum of LEVEL2_MAX_GENERATED indices from L2 into the working buffer per batch
+// These indices are used to scan the L1 index and are produced by a straight-forward method.
+const LEVEL2_MAX_GENERATED: usize = 2;
+const WORKING_BUFFER_STORAGE_REQUIRED: usize = BITS_PER_PRIM * LEVEL2_MAX_GENERATED;
+const OUTPUT_BUFFER_STORAGE_REQUIRED: usize = WORKING_BUFFER_STORAGE_REQUIRED * BITS_PER_PRIM * BITS_PER_PRIM * BITS_PER_PRIM * 4;
+
+#[repr(align(16))]
+pub struct CoolBitSetIter<'a> {
+    working_buffer: Vec<u32>,//[u32; WORKING_BUFFER_STORAGE_REQUIRED],
+    output_buffer: Vec<u32>,//[u32; OUTPUT_BUFFER_STORAGE_REQUIRED],
+    working_buffer_len: usize,
+    output_buffer_len: usize,
+    bitset: &'a BitSet,
+    iter_idx: usize,
+    // this is the bit index of level 2
+    l2_idx: usize,
+    // since the iter stores pointers into buffers in the indirect_bases we can't move it
+    _pin: std::marker::PhantomPinned,
+}
+
+impl<'a> CoolBitSetIter<'a> {
+    fn new(bitset: &'a BitSet) -> Self {
+        Self {
+            output_buffer: Vec::with_capacity(OUTPUT_BUFFER_STORAGE_REQUIRED),
+            working_buffer: Vec::with_capacity(WORKING_BUFFER_STORAGE_REQUIRED),
+            working_buffer_len: 0,
+            output_buffer_len: 0,
+            bitset: bitset,
+            iter_idx: 0,
+            l2_idx: 0,
+            _pin: std::marker::PhantomPinned,
+        }
+    }
+	unsafe fn bases(this: &mut Self) -> [IndirectBase; 2]
+	{
+		unsafe {
+        [
+            IndirectBase {
+                input_ptr: this.bitset.level1.get_unchecked(0),
+                output_ptr: this.working_buffer.get_unchecked_mut(0),
+                output_len: &mut this.working_buffer_len,
+                output_selector_tag: 1 << 30,
+            },
+            IndirectBase {
+                input_ptr: this.bitset.level0.get_unchecked(0),
+                output_ptr: this.output_buffer.get_unchecked_mut(0),
+                output_len: &mut this.output_buffer_len,
+                output_selector_tag: 0,
+            },
+        ]
+		}
+	}
+	fn output_buffer(&'a self) -> &'a [u32] {
+		unsafe {
+			&std::slice::from_raw_parts(self.output_buffer.get_unchecked(0), self.output_buffer_len)
+		}
+	}
+}
+impl<'a> Iterator for CoolBitSetIter<'a> {
+    type Item = u32;
+
+    // Here, we define the sequence using `.curr` and `.next`.
+    // The return type is `Option<T>`:
+    //     * When the `Iterator` is finished, `None` is returned.
+    //     * Otherwise, the next value is wrapped in `Some` and returned.
+    fn next(&mut self) -> Option<u32> {
+        unsafe {
+            if self.iter_idx >= self.working_buffer_len {
+				// reset the working batch
+				self.working_buffer_len = 0;
+				self.iter_idx = 0;
+				// produce new indices
+                while self.l2_idx / 64 < self.bitset.level2.len()
+                    && self.working_buffer_len < LEVEL2_MAX_GENERATED
+                {
+                    let l2_idx_element = self.l2_idx / 64;
+                    let mut bitset = self.bitset.layer2(l2_idx_element) as u64;
+					let pre_bitset = bitset;
+					// extract the bit index for the element from the lower 6 bits and create an inverted mask
+					// this mask is used to remove bit indices we have already iterated through
+                    // println!("l2 idx {} shifted {:b}", self.l2_idx & 0x3F, (1 << (self.l2_idx as u64 & 0x3Fu64)) as usize);
+					bitset = bitset & !((1u64 << (self.l2_idx & 0x3F)).checked_sub(1).unwrap_or(0));
+                    while bitset != 0 && self.working_buffer_len < LEVEL2_MAX_GENERATED {
+                        let t: u64 = bitset & bitset.overflowing_neg().0;
+                        let r = bitset.trailing_zeros();
+                        *self.working_buffer.get_unchecked_mut(self.working_buffer_len) = r + (l2_idx_element * 64) as u32;
+						self.working_buffer_len += 1;
+                        self.l2_idx = (l2_idx_element * 64) + r as usize + 1;
+                        bitset ^= t;
+                    }
+					if bitset == 0 {
+						self.l2_idx = (l2_idx_element + 1) * 64;
+					}
+                }
+				if self.iter_idx >= self.working_buffer_len {
+					return None
+				}
+            } 
+			let val = *self.working_buffer.get_unchecked(self.iter_idx);
+			self.iter_idx += 1;
+			Some(val)
+        }
+    }
+}
+
 #[repr(align(16))]
 pub struct BitSetIter<'a, D: Decoder, B: BitSetLike + 'a> {
     level2_buffer: [u32; BITS_PER_PRIM * LEVEL2_BATCH],
@@ -213,7 +318,7 @@ impl<'a, D: Decoder, B: BitSetLike> Iterator for BitSetIter<'a, D, B> {
         unsafe {
             if self.level0_idx >= self.level0_len {
                 if populate_buf(self) == 0 {
-                    return None
+                    return None;
                 }
             }
             let out = self.level0_buffer.get_unchecked(self.level0_idx);
@@ -299,7 +404,8 @@ fn main() {
     // let values = [0xABCDEFu64];
     // let values = [0xFFFFFFFFFFFFFFFFu64];
 
-    let mut bitmap = vec![0xbbae187b00003b05, 0, 1];
+    // let mut bitmap = vec![0xbbae187b00003b05, 0, 1];
+    let mut bitmap = vec![0xABCDEF];
     bitmap.resize(64 * 64 - 1, 0);
     bitmap.push(1);
 
@@ -312,11 +418,17 @@ fn main() {
     // bitmap_decode_naive(&values, &mut out);
 
     let bitset = BitSet::from_level0(bitmap.clone());
-    bitset_collect_sse2(&bitset);
-    bitset_collect_old(&bitset);
+    unsafe {
+        test_indirect(bitset);
+    }
+    test_indirect(BitSet::from_level0(interleaved_buf()));
+    test_indirect(BitSet::from_level0(random_num_buf()));
+    test_indirect(BitSet::from_level0(blocky_buf()));
+    // bitset_collect_sse2(&bitset);
+    // bitset_collect_old(&bitset);
 
-    let out: Vec<_> = bitset.decode_iter::<Sse2Decoder>().collect();
-    println!("{:b} -- {:?}", bitmap[0], out);
+    // let out: Vec<_> = bitset.decode_iter::<Sse2Decoder>().collect();
+    // println!("{:b} -- {:?}", bitmap[0], out);
 }
 
 pub unsafe fn print_bytes(prefix: &str, x: __m128i) {
@@ -378,61 +490,48 @@ unsafe fn lookup_index(mask: u16) -> __m128i {
     _mm_load_si128(LUT_INDICES.as_ptr().offset(mask as isize) as _)
 }
 
-
 fn test_indirect(b: BitSet) -> () {
-    let capacity = b.level0.len() * std::mem::size_of::<u32>() * 2;
-    let mut working_buffer: Vec<u32> = Vec::with_capacity(capacity);
-    working_buffer.extend(0..b.level1.len() as u32);
-    let mut output_buffer: Vec<u32> = Vec::with_capacity(capacity);
-    let bases = [
-        IndirectBase{
-            input_ptr:working_buffer.get_unchecked(0),
-            output_ptr:working_buffer.get_unchecked_mut(0),
-            output_len:,
-            output_selector_tag:1,
-
-        }
-    ];
-    bitmap_decode_sse2_indirect(bitmap: I, indirect_bases: &mut [IndirectBase]);
+    unsafe {
+        let mut iter = CoolBitSetIter::new(&b);
+        let iter_pinned = std::pin::Pin::new_unchecked(&mut iter);
+        bitmap_decode_sse2_indirect(iter_pinned);
+    }
 }
 
 struct IndirectBase {
     pub input_ptr: *const u64,
-    pub output_ptr: *mut u64,
-    pub output_len: usize,
+    pub output_ptr: *mut u32,
+    pub output_len: *mut usize,
     pub output_selector_tag: u32,
 }
 
-// Takes an input array of tagged u32 indices and an array of (input_pointer, output_pointer, output_len, output_selector_tag) 
+// Takes an input array of tagged u32 indices and an array of (input_pointer, output_pointer, output_len, output_selector_tag)
 // The top 2 bits of a tagged u32 input index is used to select into the indirect_bases array.
 // The bottom 30 bits of the index is added onto the input_pointer to get a u64 value to be interpreted as a bitmap
-// For each bit set in the bitmap, 
+// For each bit set in the bitmap,
 // An output u32 index is generated by multiplying the input index by 64, adding the bit index and adding the output_selector_tag.
 // All output u32 indices are written to the output_pointer of the selected indirect_base offset by its output_len.
 // The output_len is then increased by the number of output u32 indices.
-unsafe fn bitmap_decode_sse2_indirect<I, O>(bitmap: I, indirect_bases: &mut [IndirectBase])
-where
-    I: IntoIterator<Item = u32>,
-    I::IntoIter: ExactSizeIterator,
+unsafe fn bitmap_decode_sse2_indirect(bitmap_iter: std::pin::Pin<&mut CoolBitSetIter>)
 {
-
-    let bitmap_iter = bitmap.into_iter();
-
+	let mut bitmap_iter = bitmap_iter.get_unchecked_mut();
+	let mut indirect_bases = CoolBitSetIter::bases(&mut bitmap_iter);
     // debug_assert!(out.len() >= bitmap_iter.len() * 64);
 
     for idx in bitmap_iter {
         let indirect_base = indirect_bases.get_mut((idx >> 30) as usize).unwrap(); // use the top 2 bits to get which indirect base this index is for
-        // Mask away the top 2 bits to get the untagged index
+                                                                                   // Mask away the top 2 bits to get the untagged index
         let untagged_idx = idx & ((1 << 30) - 1);
         // offset the input ptr with the untagged index to get the input u64 bitmap
-        let bits = *indirect_base.input_ptr.offset(untagged_idx as isize); 
+        let bits = *indirect_base.input_ptr.offset(untagged_idx as isize);
         if bits == 0 {
             continue;
         }
 
         // Multiply the untagged index by 64 to get the index in the next level of the hierarchy,
         // then add the output_selector_tag
-        let mut base: __m128i = _mm_set1_epi32(((untagged_idx * 64) | indirect_base.output_selector_tag) as i32);
+        let mut base: __m128i =
+            _mm_set1_epi32(((untagged_idx * 64) | indirect_base.output_selector_tag) as i32);
 
         for i in 0..4 {
             let move_mask = (bits >> (i * 16)) as u16;
@@ -478,8 +577,11 @@ where
             let adv_abc = adv_ab + adv_c;
             let adv_abcd = adv_abc + adv_d;
 
-            let out_ptr = indirect_base.output_ptr.offset(indirect_base.output_len as isize);
-            indirect_base.output_len += adv_abcd as usize;
+			let len = *indirect_base.output_len;
+            let out_ptr = indirect_base
+                .output_ptr
+                .offset(len as isize);
+            *indirect_base.output_len += adv_abcd as usize;
 
             // perform the store
             _mm_storeu_si128(out_ptr as *mut _, a_out);
@@ -618,10 +720,6 @@ where
     return pos;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use test::Bencher;
 
     fn empty_buf() -> Vec<u64> {
         vec![0; 16384]
@@ -665,6 +763,10 @@ mod tests {
     fn random_num_buf() -> Vec<u64> {
         vec![0xbbae187bfcdd3b05u64; 16384]
     }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test::Bencher;
 
     #[test]
     fn test_sse2_equal_bitset() {
@@ -906,6 +1008,26 @@ mod tests {
     fn bench_ctz_blocky(b: &mut Bencher) {
         bench_decode::<CtzDecoder>(b, &blocky_buf());
     }
+    #[bench]
+    fn bench_indirect_full(b: &mut Bencher) {
+        test_indirect(BitSet::from_level0(full_buff()));
+    }
+    #[bench]
+    fn bench_indirect_test(b: &mut Bencher) {
+        // test_indirect(BitSet::from_level0(VEC_DECODE_TABLE));
+    }
+    #[bench]
+    fn bench_indirect_interleaved(b: &mut Bencher) {
+        test_indirect(BitSet::from_level0(interleaved_buf()));
+    }
+    #[bench]
+    fn bench_indirect_random(b: &mut Bencher) {
+        test_indirect(BitSet::from_level0(random_num_buf()));
+    }
+    #[bench]
+    fn bench_indirect_blocky(b: &mut Bencher) {
+        test_indirect(BitSet::from_level0(blocky_buf()));
+    }
 
     const VEC_DECODE_TABLE: [u64; 106] = [
         0x00010203, 0x04050607, 0x08090A0B, 0x0C, 0x0D, 0x0E, 0x0F101112, 0x13141516, 0x1718191A,
@@ -920,283 +1042,4 @@ mod tests {
         0xD6D7D8D9, 0xDADBDCDD, 0xDE, 0xDF, 0xE0, 0xE1E2E3E4, 0xE5E6E7E8, 0xE9EAEBEC, 0xED, 0xEE,
         0xEF, 0xF0F1F2F3, 0xF4F5F6F7, 0xF8F9FAFB, 0xFC, 0xFD, 0xFE, 0xFF,
     ];
-    // const VEC_DECODE_TABLE: [u64; 256] = [
-    //     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
-    //     0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
-    //     0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C,
-    //     0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B,
-    //     0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A,
-    //     0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
-    //     0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
-    //     0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77,
-    //     0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86,
-    //     0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95,
-    //     0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4,
-    //     0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF, 0xB0, 0xB1, 0xB2, 0xB3,
-    //     0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, 0xC1, 0xC2,
-    //     0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF, 0xD0, 0xD1,
-    //     0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF, 0xE0,
-    //     0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF,
-    //     0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE,
-    //     0xFF,
-    // ];
-
-    // static uint8_t vecDecodeTableByte[256][8] ALIGNED(16)  = {
-    //     { 0, 0, 0, 0, 0, 0, 0, 0 }, /* 0x00 (00000000) */
-    //     { 1, 0, 0, 0, 0, 0, 0, 0 }, /* 0x01 (00000001) */
-    //     { 2, 0, 0, 0, 0, 0, 0, 0 }, /* 0x02 (00000010) */
-    //     { 1, 2, 0, 0, 0, 0, 0, 0 }, /* 0x03 (00000011) */
-    //     { 3, 0, 0, 0, 0, 0, 0, 0 }, /* 0x04 (00000100) */
-    //     { 1, 3, 0, 0, 0, 0, 0, 0 }, /* 0x05 (00000101) */
-    //     { 2, 3, 0, 0, 0, 0, 0, 0 }, /* 0x06 (00000110) */
-    //     { 1, 2, 3, 0, 0, 0, 0, 0 }, /* 0x07 (00000111) */
-    //     { 4, 0, 0, 0, 0, 0, 0, 0 }, /* 0x08 (00001000) */
-    //     { 1, 4, 0, 0, 0, 0, 0, 0 }, /* 0x09 (00001001) */
-    //     { 2, 4, 0, 0, 0, 0, 0, 0 }, /* 0x0A (00001010) */
-    //     { 1, 2, 4, 0, 0, 0, 0, 0 }, /* 0x0B (00001011) */
-    //     { 3, 4, 0, 0, 0, 0, 0, 0 }, /* 0x0C (00001100) */
-    //     { 1, 3, 4, 0, 0, 0, 0, 0 }, /* 0x0D (00001101) */
-    //     { 2, 3, 4, 0, 0, 0, 0, 0 }, /* 0x0E (00001110) */
-    //     { 1, 2, 3, 4, 0, 0, 0, 0 }, /* 0x0F (00001111) */
-    //     { 5, 0, 0, 0, 0, 0, 0, 0 }, /* 0x10 (00010000) */
-    //     { 1, 5, 0, 0, 0, 0, 0, 0 }, /* 0x11 (00010001) */
-    //     { 2, 5, 0, 0, 0, 0, 0, 0 }, /* 0x12 (00010010) */
-    //     { 1, 2, 5, 0, 0, 0, 0, 0 }, /* 0x13 (00010011) */
-    //     { 3, 5, 0, 0, 0, 0, 0, 0 }, /* 0x14 (00010100) */
-    //     { 1, 3, 5, 0, 0, 0, 0, 0 }, /* 0x15 (00010101) */
-    //     { 2, 3, 5, 0, 0, 0, 0, 0 }, /* 0x16 (00010110) */
-    //     { 1, 2, 3, 5, 0, 0, 0, 0 }, /* 0x17 (00010111) */
-    //     { 4, 5, 0, 0, 0, 0, 0, 0 }, /* 0x18 (00011000) */
-    //     { 1, 4, 5, 0, 0, 0, 0, 0 }, /* 0x19 (00011001) */
-    //     { 2, 4, 5, 0, 0, 0, 0, 0 }, /* 0x1A (00011010) */
-    //     { 1, 2, 4, 5, 0, 0, 0, 0 }, /* 0x1B (00011011) */
-    //     { 3, 4, 5, 0, 0, 0, 0, 0 }, /* 0x1C (00011100) */
-    //     { 1, 3, 4, 5, 0, 0, 0, 0 }, /* 0x1D (00011101) */
-    //     { 2, 3, 4, 5, 0, 0, 0, 0 }, /* 0x1E (00011110) */
-    //     { 1, 2, 3, 4, 5, 0, 0, 0 }, /* 0x1F (00011111) */
-    //     { 6, 0, 0, 0, 0, 0, 0, 0 }, /* 0x20 (00100000) */
-    //     { 1, 6, 0, 0, 0, 0, 0, 0 }, /* 0x21 (00100001) */
-    //     { 2, 6, 0, 0, 0, 0, 0, 0 }, /* 0x22 (00100010) */
-    //     { 1, 2, 6, 0, 0, 0, 0, 0 }, /* 0x23 (00100011) */
-    //     { 3, 6, 0, 0, 0, 0, 0, 0 }, /* 0x24 (00100100) */
-    //     { 1, 3, 6, 0, 0, 0, 0, 0 }, /* 0x25 (00100101) */
-    //     { 2, 3, 6, 0, 0, 0, 0, 0 }, /* 0x26 (00100110) */
-    //     { 1, 2, 3, 6, 0, 0, 0, 0 }, /* 0x27 (00100111) */
-    //     { 4, 6, 0, 0, 0, 0, 0, 0 }, /* 0x28 (00101000) */
-    //     { 1, 4, 6, 0, 0, 0, 0, 0 }, /* 0x29 (00101001) */
-    //     { 2, 4, 6, 0, 0, 0, 0, 0 }, /* 0x2A (00101010) */
-    //     { 1, 2, 4, 6, 0, 0, 0, 0 }, /* 0x2B (00101011) */
-    //     { 3, 4, 6, 0, 0, 0, 0, 0 }, /* 0x2C (00101100) */
-    //     { 1, 3, 4, 6, 0, 0, 0, 0 }, /* 0x2D (00101101) */
-    //     { 2, 3, 4, 6, 0, 0, 0, 0 }, /* 0x2E (00101110) */
-    //     { 1, 2, 3, 4, 6, 0, 0, 0 }, /* 0x2F (00101111) */
-    //     { 5, 6, 0, 0, 0, 0, 0, 0 }, /* 0x30 (00110000) */
-    //     { 1, 5, 6, 0, 0, 0, 0, 0 }, /* 0x31 (00110001) */
-    //     { 2, 5, 6, 0, 0, 0, 0, 0 }, /* 0x32 (00110010) */
-    //     { 1, 2, 5, 6, 0, 0, 0, 0 }, /* 0x33 (00110011) */
-    //     { 3, 5, 6, 0, 0, 0, 0, 0 }, /* 0x34 (00110100) */
-    //     { 1, 3, 5, 6, 0, 0, 0, 0 }, /* 0x35 (00110101) */
-    //     { 2, 3, 5, 6, 0, 0, 0, 0 }, /* 0x36 (00110110) */
-    //     { 1, 2, 3, 5, 6, 0, 0, 0 }, /* 0x37 (00110111) */
-    //     { 4, 5, 6, 0, 0, 0, 0, 0 }, /* 0x38 (00111000) */
-    //     { 1, 4, 5, 6, 0, 0, 0, 0 }, /* 0x39 (00111001) */
-    //     { 2, 4, 5, 6, 0, 0, 0, 0 }, /* 0x3A (00111010) */
-    //     { 1, 2, 4, 5, 6, 0, 0, 0 }, /* 0x3B (00111011) */
-    //     { 3, 4, 5, 6, 0, 0, 0, 0 }, /* 0x3C (00111100) */
-    //     { 1, 3, 4, 5, 6, 0, 0, 0 }, /* 0x3D (00111101) */
-    //     { 2, 3, 4, 5, 6, 0, 0, 0 }, /* 0x3E (00111110) */
-    //     { 1, 2, 3, 4, 5, 6, 0, 0 }, /* 0x3F (00111111) */
-    //     { 7, 0, 0, 0, 0, 0, 0, 0 }, /* 0x40 (01000000) */
-    //     { 1, 7, 0, 0, 0, 0, 0, 0 }, /* 0x41 (01000001) */
-    //     { 2, 7, 0, 0, 0, 0, 0, 0 }, /* 0x42 (01000010) */
-    //     { 1, 2, 7, 0, 0, 0, 0, 0 }, /* 0x43 (01000011) */
-    //     { 3, 7, 0, 0, 0, 0, 0, 0 }, /* 0x44 (01000100) */
-    //     { 1, 3, 7, 0, 0, 0, 0, 0 }, /* 0x45 (01000101) */
-    //     { 2, 3, 7, 0, 0, 0, 0, 0 }, /* 0x46 (01000110) */
-    //     { 1, 2, 3, 7, 0, 0, 0, 0 }, /* 0x47 (01000111) */
-    //     { 4, 7, 0, 0, 0, 0, 0, 0 }, /* 0x48 (01001000) */
-    //     { 1, 4, 7, 0, 0, 0, 0, 0 }, /* 0x49 (01001001) */
-    //     { 2, 4, 7, 0, 0, 0, 0, 0 }, /* 0x4A (01001010) */
-    //     { 1, 2, 4, 7, 0, 0, 0, 0 }, /* 0x4B (01001011) */
-    //     { 3, 4, 7, 0, 0, 0, 0, 0 }, /* 0x4C (01001100) */
-    //     { 1, 3, 4, 7, 0, 0, 0, 0 }, /* 0x4D (01001101) */
-    //     { 2, 3, 4, 7, 0, 0, 0, 0 }, /* 0x4E (01001110) */
-    //     { 1, 2, 3, 4, 7, 0, 0, 0 }, /* 0x4F (01001111) */
-    //     { 5, 7, 0, 0, 0, 0, 0, 0 }, /* 0x50 (01010000) */
-    //     { 1, 5, 7, 0, 0, 0, 0, 0 }, /* 0x51 (01010001) */
-    //     { 2, 5, 7, 0, 0, 0, 0, 0 }, /* 0x52 (01010010) */
-    //     { 1, 2, 5, 7, 0, 0, 0, 0 }, /* 0x53 (01010011) */
-    //     { 3, 5, 7, 0, 0, 0, 0, 0 }, /* 0x54 (01010100) */
-    //     { 1, 3, 5, 7, 0, 0, 0, 0 }, /* 0x55 (01010101) */
-    //     { 2, 3, 5, 7, 0, 0, 0, 0 }, /* 0x56 (01010110) */
-    //     { 1, 2, 3, 5, 7, 0, 0, 0 }, /* 0x57 (01010111) */
-    //     { 4, 5, 7, 0, 0, 0, 0, 0 }, /* 0x58 (01011000) */
-    //     { 1, 4, 5, 7, 0, 0, 0, 0 }, /* 0x59 (01011001) */
-    //     { 2, 4, 5, 7, 0, 0, 0, 0 }, /* 0x5A (01011010) */
-    //     { 1, 2, 4, 5, 7, 0, 0, 0 }, /* 0x5B (01011011) */
-    //     { 3, 4, 5, 7, 0, 0, 0, 0 }, /* 0x5C (01011100) */
-    //     { 1, 3, 4, 5, 7, 0, 0, 0 }, /* 0x5D (01011101) */
-    //     { 2, 3, 4, 5, 7, 0, 0, 0 }, /* 0x5E (01011110) */
-    //     { 1, 2, 3, 4, 5, 7, 0, 0 }, /* 0x5F (01011111) */
-    //     { 6, 7, 0, 0, 0, 0, 0, 0 }, /* 0x60 (01100000) */
-    //     { 1, 6, 7, 0, 0, 0, 0, 0 }, /* 0x61 (01100001) */
-    //     { 2, 6, 7, 0, 0, 0, 0, 0 }, /* 0x62 (01100010) */
-    //     { 1, 2, 6, 7, 0, 0, 0, 0 }, /* 0x63 (01100011) */
-    //     { 3, 6, 7, 0, 0, 0, 0, 0 }, /* 0x64 (01100100) */
-    //     { 1, 3, 6, 7, 0, 0, 0, 0 }, /* 0x65 (01100101) */
-    //     { 2, 3, 6, 7, 0, 0, 0, 0 }, /* 0x66 (01100110) */
-    //     { 1, 2, 3, 6, 7, 0, 0, 0 }, /* 0x67 (01100111) */
-    //     { 4, 6, 7, 0, 0, 0, 0, 0 }, /* 0x68 (01101000) */
-    //     { 1, 4, 6, 7, 0, 0, 0, 0 }, /* 0x69 (01101001) */
-    //     { 2, 4, 6, 7, 0, 0, 0, 0 }, /* 0x6A (01101010) */
-    //     { 1, 2, 4, 6, 7, 0, 0, 0 }, /* 0x6B (01101011) */
-    //     { 3, 4, 6, 7, 0, 0, 0, 0 }, /* 0x6C (01101100) */
-    //     { 1, 3, 4, 6, 7, 0, 0, 0 }, /* 0x6D (01101101) */
-    //     { 2, 3, 4, 6, 7, 0, 0, 0 }, /* 0x6E (01101110) */
-    //     { 1, 2, 3, 4, 6, 7, 0, 0 }, /* 0x6F (01101111) */
-    //     { 5, 6, 7, 0, 0, 0, 0, 0 }, /* 0x70 (01110000) */
-    //     { 1, 5, 6, 7, 0, 0, 0, 0 }, /* 0x71 (01110001) */
-    //     { 2, 5, 6, 7, 0, 0, 0, 0 }, /* 0x72 (01110010) */
-    //     { 1, 2, 5, 6, 7, 0, 0, 0 }, /* 0x73 (01110011) */
-    //     { 3, 5, 6, 7, 0, 0, 0, 0 }, /* 0x74 (01110100) */
-    //     { 1, 3, 5, 6, 7, 0, 0, 0 }, /* 0x75 (01110101) */
-    //     { 2, 3, 5, 6, 7, 0, 0, 0 }, /* 0x76 (01110110) */
-    //     { 1, 2, 3, 5, 6, 7, 0, 0 }, /* 0x77 (01110111) */
-    //     { 4, 5, 6, 7, 0, 0, 0, 0 }, /* 0x78 (01111000) */
-    //     { 1, 4, 5, 6, 7, 0, 0, 0 }, /* 0x79 (01111001) */
-    //     { 2, 4, 5, 6, 7, 0, 0, 0 }, /* 0x7A (01111010) */
-    //     { 1, 2, 4, 5, 6, 7, 0, 0 }, /* 0x7B (01111011) */
-    //     { 3, 4, 5, 6, 7, 0, 0, 0 }, /* 0x7C (01111100) */
-    //     { 1, 3, 4, 5, 6, 7, 0, 0 }, /* 0x7D (01111101) */
-    //     { 2, 3, 4, 5, 6, 7, 0, 0 }, /* 0x7E (01111110) */
-    //     { 1, 2, 3, 4, 5, 6, 7, 0 }, /* 0x7F (01111111) */
-    //     { 8, 0, 0, 0, 0, 0, 0, 0 }, /* 0x80 (10000000) */
-    //     { 1, 8, 0, 0, 0, 0, 0, 0 }, /* 0x81 (10000001) */
-    //     { 2, 8, 0, 0, 0, 0, 0, 0 }, /* 0x82 (10000010) */
-    //     { 1, 2, 8, 0, 0, 0, 0, 0 }, /* 0x83 (10000011) */
-    //     { 3, 8, 0, 0, 0, 0, 0, 0 }, /* 0x84 (10000100) */
-    //     { 1, 3, 8, 0, 0, 0, 0, 0 }, /* 0x85 (10000101) */
-    //     { 2, 3, 8, 0, 0, 0, 0, 0 }, /* 0x86 (10000110) */
-    //     { 1, 2, 3, 8, 0, 0, 0, 0 }, /* 0x87 (10000111) */
-    //     { 4, 8, 0, 0, 0, 0, 0, 0 }, /* 0x88 (10001000) */
-    //     { 1, 4, 8, 0, 0, 0, 0, 0 }, /* 0x89 (10001001) */
-    //     { 2, 4, 8, 0, 0, 0, 0, 0 }, /* 0x8A (10001010) */
-    //     { 1, 2, 4, 8, 0, 0, 0, 0 }, /* 0x8B (10001011) */
-    //     { 3, 4, 8, 0, 0, 0, 0, 0 }, /* 0x8C (10001100) */
-    //     { 1, 3, 4, 8, 0, 0, 0, 0 }, /* 0x8D (10001101) */
-    //     { 2, 3, 4, 8, 0, 0, 0, 0 }, /* 0x8E (10001110) */
-    //     { 1, 2, 3, 4, 8, 0, 0, 0 }, /* 0x8F (10001111) */
-    //     { 5, 8, 0, 0, 0, 0, 0, 0 }, /* 0x90 (10010000) */
-    //     { 1, 5, 8, 0, 0, 0, 0, 0 }, /* 0x91 (10010001) */
-    //     { 2, 5, 8, 0, 0, 0, 0, 0 }, /* 0x92 (10010010) */
-    //     { 1, 2, 5, 8, 0, 0, 0, 0 }, /* 0x93 (10010011) */
-    //     { 3, 5, 8, 0, 0, 0, 0, 0 }, /* 0x94 (10010100) */
-    //     { 1, 3, 5, 8, 0, 0, 0, 0 }, /* 0x95 (10010101) */
-    //     { 2, 3, 5, 8, 0, 0, 0, 0 }, /* 0x96 (10010110) */
-    //     { 1, 2, 3, 5, 8, 0, 0, 0 }, /* 0x97 (10010111) */
-    //     { 4, 5, 8, 0, 0, 0, 0, 0 }, /* 0x98 (10011000) */
-    //     { 1, 4, 5, 8, 0, 0, 0, 0 }, /* 0x99 (10011001) */
-    //     { 2, 4, 5, 8, 0, 0, 0, 0 }, /* 0x9A (10011010) */
-    //     { 1, 2, 4, 5, 8, 0, 0, 0 }, /* 0x9B (10011011) */
-    //     { 3, 4, 5, 8, 0, 0, 0, 0 }, /* 0x9C (10011100) */
-    //     { 1, 3, 4, 5, 8, 0, 0, 0 }, /* 0x9D (10011101) */
-    //     { 2, 3, 4, 5, 8, 0, 0, 0 }, /* 0x9E (10011110) */
-    //     { 1, 2, 3, 4, 5, 8, 0, 0 }, /* 0x9F (10011111) */
-    //     { 6, 8, 0, 0, 0, 0, 0, 0 }, /* 0xA0 (10100000) */
-    //     { 1, 6, 8, 0, 0, 0, 0, 0 }, /* 0xA1 (10100001) */
-    //     { 2, 6, 8, 0, 0, 0, 0, 0 }, /* 0xA2 (10100010) */
-    //     { 1, 2, 6, 8, 0, 0, 0, 0 }, /* 0xA3 (10100011) */
-    //     { 3, 6, 8, 0, 0, 0, 0, 0 }, /* 0xA4 (10100100) */
-    //     { 1, 3, 6, 8, 0, 0, 0, 0 }, /* 0xA5 (10100101) */
-    //     { 2, 3, 6, 8, 0, 0, 0, 0 }, /* 0xA6 (10100110) */
-    //     { 1, 2, 3, 6, 8, 0, 0, 0 }, /* 0xA7 (10100111) */
-    //     { 4, 6, 8, 0, 0, 0, 0, 0 }, /* 0xA8 (10101000) */
-    //     { 1, 4, 6, 8, 0, 0, 0, 0 }, /* 0xA9 (10101001) */
-    //     { 2, 4, 6, 8, 0, 0, 0, 0 }, /* 0xAA (10101010) */
-    //     { 1, 2, 4, 6, 8, 0, 0, 0 }, /* 0xAB (10101011) */
-    //     { 3, 4, 6, 8, 0, 0, 0, 0 }, /* 0xAC (10101100) */
-    //     { 1, 3, 4, 6, 8, 0, 0, 0 }, /* 0xAD (10101101) */
-    //     { 2, 3, 4, 6, 8, 0, 0, 0 }, /* 0xAE (10101110) */
-    //     { 1, 2, 3, 4, 6, 8, 0, 0 }, /* 0xAF (10101111) */
-    //     { 5, 6, 8, 0, 0, 0, 0, 0 }, /* 0xB0 (10110000) */
-    //     { 1, 5, 6, 8, 0, 0, 0, 0 }, /* 0xB1 (10110001) */
-    //     { 2, 5, 6, 8, 0, 0, 0, 0 }, /* 0xB2 (10110010) */
-    //     { 1, 2, 5, 6, 8, 0, 0, 0 }, /* 0xB3 (10110011) */
-    //     { 3, 5, 6, 8, 0, 0, 0, 0 }, /* 0xB4 (10110100) */
-    //     { 1, 3, 5, 6, 8, 0, 0, 0 }, /* 0xB5 (10110101) */
-    //     { 2, 3, 5, 6, 8, 0, 0, 0 }, /* 0xB6 (10110110) */
-    //     { 1, 2, 3, 5, 6, 8, 0, 0 }, /* 0xB7 (10110111) */
-    //     { 4, 5, 6, 8, 0, 0, 0, 0 }, /* 0xB8 (10111000) */
-    //     { 1, 4, 5, 6, 8, 0, 0, 0 }, /* 0xB9 (10111001) */
-    //     { 2, 4, 5, 6, 8, 0, 0, 0 }, /* 0xBA (10111010) */
-    //     { 1, 2, 4, 5, 6, 8, 0, 0 }, /* 0xBB (10111011) */
-    //     { 3, 4, 5, 6, 8, 0, 0, 0 }, /* 0xBC (10111100) */
-    //     { 1, 3, 4, 5, 6, 8, 0, 0 }, /* 0xBD (10111101) */
-    //     { 2, 3, 4, 5, 6, 8, 0, 0 }, /* 0xBE (10111110) */
-    //     { 1, 2, 3, 4, 5, 6, 8, 0 }, /* 0xBF (10111111) */
-    //     { 7, 8, 0, 0, 0, 0, 0, 0 }, /* 0xC0 (11000000) */
-    //     { 1, 7, 8, 0, 0, 0, 0, 0 }, /* 0xC1 (11000001) */
-    //     { 2, 7, 8, 0, 0, 0, 0, 0 }, /* 0xC2 (11000010) */
-    //     { 1, 2, 7, 8, 0, 0, 0, 0 }, /* 0xC3 (11000011) */
-    //     { 3, 7, 8, 0, 0, 0, 0, 0 }, /* 0xC4 (11000100) */
-    //     { 1, 3, 7, 8, 0, 0, 0, 0 }, /* 0xC5 (11000101) */
-    //     { 2, 3, 7, 8, 0, 0, 0, 0 }, /* 0xC6 (11000110) */
-    //     { 1, 2, 3, 7, 8, 0, 0, 0 }, /* 0xC7 (11000111) */
-    //     { 4, 7, 8, 0, 0, 0, 0, 0 }, /* 0xC8 (11001000) */
-    //     { 1, 4, 7, 8, 0, 0, 0, 0 }, /* 0xC9 (11001001) */
-    //     { 2, 4, 7, 8, 0, 0, 0, 0 }, /* 0xCA (11001010) */
-    //     { 1, 2, 4, 7, 8, 0, 0, 0 }, /* 0xCB (11001011) */
-    //     { 3, 4, 7, 8, 0, 0, 0, 0 }, /* 0xCC (11001100) */
-    //     { 1, 3, 4, 7, 8, 0, 0, 0 }, /* 0xCD (11001101) */
-    //     { 2, 3, 4, 7, 8, 0, 0, 0 }, /* 0xCE (11001110) */
-    //     { 1, 2, 3, 4, 7, 8, 0, 0 }, /* 0xCF (11001111) */
-    //     { 5, 7, 8, 0, 0, 0, 0, 0 }, /* 0xD0 (11010000) */
-    //     { 1, 5, 7, 8, 0, 0, 0, 0 }, /* 0xD1 (11010001) */
-    //     { 2, 5, 7, 8, 0, 0, 0, 0 }, /* 0xD2 (11010010) */
-    //     { 1, 2, 5, 7, 8, 0, 0, 0 }, /* 0xD3 (11010011) */
-    //     { 3, 5, 7, 8, 0, 0, 0, 0 }, /* 0xD4 (11010100) */
-    //     { 1, 3, 5, 7, 8, 0, 0, 0 }, /* 0xD5 (11010101) */
-    //     { 2, 3, 5, 7, 8, 0, 0, 0 }, /* 0xD6 (11010110) */
-    //     { 1, 2, 3, 5, 7, 8, 0, 0 }, /* 0xD7 (11010111) */
-    //     { 4, 5, 7, 8, 0, 0, 0, 0 }, /* 0xD8 (11011000) */
-    //     { 1, 4, 5, 7, 8, 0, 0, 0 }, /* 0xD9 (11011001) */
-    //     { 2, 4, 5, 7, 8, 0, 0, 0 }, /* 0xDA (11011010) */
-    //     { 1, 2, 4, 5, 7, 8, 0, 0 }, /* 0xDB (11011011) */
-    //     { 3, 4, 5, 7, 8, 0, 0, 0 }, /* 0xDC (11011100) */
-    //     { 1, 3, 4, 5, 7, 8, 0, 0 }, /* 0xDD (11011101) */
-    //     { 2, 3, 4, 5, 7, 8, 0, 0 }, /* 0xDE (11011110) */
-    //     { 1, 2, 3, 4, 5, 7, 8, 0 }, /* 0xDF (11011111) */
-    //     { 6, 7, 8, 0, 0, 0, 0, 0 }, /* 0xE0 (11100000) */
-    //     { 1, 6, 7, 8, 0, 0, 0, 0 }, /* 0xE1 (11100001) */
-    //     { 2, 6, 7, 8, 0, 0, 0, 0 }, /* 0xE2 (11100010) */
-    //     { 1, 2, 6, 7, 8, 0, 0, 0 }, /* 0xE3 (11100011) */
-    //     { 3, 6, 7, 8, 0, 0, 0, 0 }, /* 0xE4 (11100100) */
-    //     { 1, 3, 6, 7, 8, 0, 0, 0 }, /* 0xE5 (11100101) */
-    //     { 2, 3, 6, 7, 8, 0, 0, 0 }, /* 0xE6 (11100110) */
-    //     { 1, 2, 3, 6, 7, 8, 0, 0 }, /* 0xE7 (11100111) */
-    //     { 4, 6, 7, 8, 0, 0, 0, 0 }, /* 0xE8 (11101000) */
-    //     { 1, 4, 6, 7, 8, 0, 0, 0 }, /* 0xE9 (11101001) */
-    //     { 2, 4, 6, 7, 8, 0, 0, 0 }, /* 0xEA (11101010) */
-    //     { 1, 2, 4, 6, 7, 8, 0, 0 }, /* 0xEB (11101011) */
-    //     { 3, 4, 6, 7, 8, 0, 0, 0 }, /* 0xEC (11101100) */
-    //     { 1, 3, 4, 6, 7, 8, 0, 0 }, /* 0xED (11101101) */
-    //     { 2, 3, 4, 6, 7, 8, 0, 0 }, /* 0xEE (11101110) */
-    //     { 1, 2, 3, 4, 6, 7, 8, 0 }, /* 0xEF (11101111) */
-    //     { 5, 6, 7, 8, 0, 0, 0, 0 }, /* 0xF0 (11110000) */
-    //     { 1, 5, 6, 7, 8, 0, 0, 0 }, /* 0xF1 (11110001) */
-    //     { 2, 5, 6, 7, 8, 0, 0, 0 }, /* 0xF2 (11110010) */
-    //     { 1, 2, 5, 6, 7, 8, 0, 0 }, /* 0xF3 (11110011) */
-    //     { 3, 5, 6, 7, 8, 0, 0, 0 }, /* 0xF4 (11110100) */
-    //     { 1, 3, 5, 6, 7, 8, 0, 0 }, /* 0xF5 (11110101) */
-    //     { 2, 3, 5, 6, 7, 8, 0, 0 }, /* 0xF6 (11110110) */
-    //     { 1, 2, 3, 5, 6, 7, 8, 0 }, /* 0xF7 (11110111) */
-    //     { 4, 5, 6, 7, 8, 0, 0, 0 }, /* 0xF8 (11111000) */
-    //     { 1, 4, 5, 6, 7, 8, 0, 0 }, /* 0xF9 (11111001) */
-    //     { 2, 4, 5, 6, 7, 8, 0, 0 }, /* 0xFA (11111010) */
-    //     { 1, 2, 4, 5, 6, 7, 8, 0 }, /* 0xFB (11111011) */
-    //     { 3, 4, 5, 6, 7, 8, 0, 0 }, /* 0xFC (11111100) */
-    //     { 1, 3, 4, 5, 6, 7, 8, 0 }, /* 0xFD (11111101) */
-    //     { 2, 3, 4, 5, 6, 7, 8, 0 }, /* 0xFE (11111110) */
-    //     { 1, 2, 3, 4, 5, 6, 7, 8 }  /* 0xFF (11111111) */
-    // };
 }
