@@ -101,12 +101,13 @@ impl BitSetLike for BitSet {
 // These indices are used to scan the L1 index and are produced by a straight-forward method.
 const LEVEL2_MAX_GENERATED: usize = 2;
 const WORKING_BUFFER_STORAGE_REQUIRED: usize = BITS_PER_PRIM * LEVEL2_MAX_GENERATED;
-const OUTPUT_BUFFER_STORAGE_REQUIRED: usize = WORKING_BUFFER_STORAGE_REQUIRED * BITS_PER_PRIM * BITS_PER_PRIM * BITS_PER_PRIM * 4;
+const OUTPUT_BUFFER_STORAGE_REQUIRED: usize =
+    WORKING_BUFFER_STORAGE_REQUIRED * BITS_PER_PRIM * BITS_PER_PRIM * BITS_PER_PRIM * 4;
 
 #[repr(align(16))]
 pub struct CoolBitSetIter<'a> {
-    working_buffer: Vec<u32>,//[u32; WORKING_BUFFER_STORAGE_REQUIRED],
-    output_buffer: Vec<u32>,//[u32; OUTPUT_BUFFER_STORAGE_REQUIRED],
+    working_buffer: Vec<u32>, //[u32; WORKING_BUFFER_STORAGE_REQUIRED],
+    output_buffer: Vec<u32>,  //[u32; OUTPUT_BUFFER_STORAGE_REQUIRED],
     working_buffer_len: usize,
     output_buffer_len: usize,
     bitset: &'a BitSet,
@@ -130,30 +131,29 @@ impl<'a> CoolBitSetIter<'a> {
             _pin: std::marker::PhantomPinned,
         }
     }
-	unsafe fn bases(this: &mut Self) -> [IndirectBase; 2]
-	{
-		unsafe {
-        [
-            IndirectBase {
-                input_ptr: this.bitset.level1.get_unchecked(0),
-                output_ptr: this.working_buffer.get_unchecked_mut(0),
-                output_len: &mut this.working_buffer_len,
-                output_selector_tag: 1 << 30,
-            },
-            IndirectBase {
-                input_ptr: this.bitset.level0.get_unchecked(0),
-                output_ptr: this.output_buffer.get_unchecked_mut(0),
-                output_len: &mut this.output_buffer_len,
-                output_selector_tag: 0,
-            },
-        ]
-		}
-	}
-	fn output_buffer(&'a self) -> &'a [u32] {
-		unsafe {
-			&std::slice::from_raw_parts(self.output_buffer.get_unchecked(0), self.output_buffer_len)
-		}
-	}
+    unsafe fn bases(this: &mut Self) -> [IndirectBase; 2] {
+        unsafe {
+            [
+                IndirectBase {
+                    input_ptr: this.bitset.level1.get_unchecked(0),
+                    output_ptr: this.working_buffer.get_unchecked_mut(0),
+                    output_len: &mut this.working_buffer_len,
+                    output_selector_tag: 1 << 30,
+                },
+                IndirectBase {
+                    input_ptr: this.bitset.level0.get_unchecked(0),
+                    output_ptr: this.output_buffer.get_unchecked_mut(0),
+                    output_len: &mut this.output_buffer_len,
+                    output_selector_tag: 0,
+                },
+            ]
+        }
+    }
+    fn output_buffer(&'a self) -> &'a [u32] {
+        unsafe {
+            &std::slice::from_raw_parts(self.output_buffer.get_unchecked(0), self.output_buffer_len)
+        }
+    }
 }
 impl<'a> Iterator for CoolBitSetIter<'a> {
     type Item = u32;
@@ -165,39 +165,42 @@ impl<'a> Iterator for CoolBitSetIter<'a> {
     fn next(&mut self) -> Option<u32> {
         unsafe {
             if self.iter_idx >= self.working_buffer_len {
-				// reset the working batch
-				self.working_buffer_len = 0;
-				self.iter_idx = 0;
-				// produce new indices
+                // reset the working batch
+                self.working_buffer_len = 0;
+                self.iter_idx = 0;
+                // produce new indices
                 while self.l2_idx / 64 < self.bitset.level2.len()
                     && self.working_buffer_len < LEVEL2_MAX_GENERATED
                 {
                     let l2_idx_element = self.l2_idx / 64;
                     let mut bitset = self.bitset.layer2(l2_idx_element) as u64;
-					let pre_bitset = bitset;
-					// extract the bit index for the element from the lower 6 bits and create an inverted mask
-					// this mask is used to remove bit indices we have already iterated through
+                    let pre_bitset = bitset;
+                    // extract the bit index for the element from the lower 6 bits and create an inverted mask
+                    // this mask is used to remove bit indices we have already iterated through
                     // println!("l2 idx {} shifted {:b}", self.l2_idx & 0x3F, (1 << (self.l2_idx as u64 & 0x3Fu64)) as usize);
-					bitset = bitset & !((1u64 << (self.l2_idx & 0x3F)).checked_sub(1).unwrap_or(0));
+                    bitset = bitset & !((1u64 << (self.l2_idx & 0x3F)).checked_sub(1).unwrap_or(0));
                     while bitset != 0 && self.working_buffer_len < LEVEL2_MAX_GENERATED {
                         let t: u64 = bitset & bitset.overflowing_neg().0;
                         let r = bitset.trailing_zeros();
-                        *self.working_buffer.get_unchecked_mut(self.working_buffer_len) = r + (l2_idx_element * 64) as u32;
-						self.working_buffer_len += 1;
+                        *self
+                            .working_buffer
+                            .get_unchecked_mut(self.working_buffer_len) =
+                            r + (l2_idx_element * 64) as u32;
+                        self.working_buffer_len += 1;
                         self.l2_idx = (l2_idx_element * 64) + r as usize + 1;
                         bitset ^= t;
                     }
-					if bitset == 0 {
-						self.l2_idx = (l2_idx_element + 1) * 64;
-					}
+                    if bitset == 0 {
+                        self.l2_idx = (l2_idx_element + 1) * 64;
+                    }
                 }
-				if self.iter_idx >= self.working_buffer_len {
-					return None
-				}
-            } 
-			let val = *self.working_buffer.get_unchecked(self.iter_idx);
-			self.iter_idx += 1;
-			Some(val)
+                if self.iter_idx >= self.working_buffer_len {
+                    return None;
+                }
+            }
+            let val = *self.working_buffer.get_unchecked(self.iter_idx);
+            self.iter_idx += 1;
+            Some(val)
         }
     }
 }
@@ -512,10 +515,9 @@ struct IndirectBase {
 // An output u32 index is generated by multiplying the input index by 64, adding the bit index and adding the output_selector_tag.
 // All output u32 indices are written to the output_pointer of the selected indirect_base offset by its output_len.
 // The output_len is then increased by the number of output u32 indices.
-unsafe fn bitmap_decode_sse2_indirect(bitmap_iter: std::pin::Pin<&mut CoolBitSetIter>)
-{
-	let mut bitmap_iter = bitmap_iter.get_unchecked_mut();
-	let mut indirect_bases = CoolBitSetIter::bases(&mut bitmap_iter);
+unsafe fn bitmap_decode_sse2_indirect(bitmap_iter: std::pin::Pin<&mut CoolBitSetIter>) {
+    let mut bitmap_iter = bitmap_iter.get_unchecked_mut();
+    let mut indirect_bases = CoolBitSetIter::bases(&mut bitmap_iter);
     // debug_assert!(out.len() >= bitmap_iter.len() * 64);
 
     for idx in bitmap_iter {
@@ -577,10 +579,8 @@ unsafe fn bitmap_decode_sse2_indirect(bitmap_iter: std::pin::Pin<&mut CoolBitSet
             let adv_abc = adv_ab + adv_c;
             let adv_abcd = adv_abc + adv_d;
 
-			let len = *indirect_base.output_len;
-            let out_ptr = indirect_base
-                .output_ptr
-                .offset(len as isize);
+            let len = *indirect_base.output_len;
+            let out_ptr = indirect_base.output_ptr.offset(len as isize);
             *indirect_base.output_len += adv_abcd as usize;
 
             // perform the store
@@ -720,49 +720,48 @@ where
     return pos;
 }
 
+fn empty_buf() -> Vec<u64> {
+    vec![0; 16384]
+}
 
-    fn empty_buf() -> Vec<u64> {
-        vec![0; 16384]
-    }
+fn full_buff() -> Vec<u64> {
+    vec![0xFFFFFFFFFFFFFFFFu64; 16384]
+}
 
-    fn full_buff() -> Vec<u64> {
-        vec![0xFFFFFFFFFFFFFFFFu64; 16384]
-    }
+fn blocky_buf() -> Vec<u64> {
+    use std::iter::repeat;
 
-    fn blocky_buf() -> Vec<u64> {
-        use std::iter::repeat;
+    // a single long sequence of chains trips up the compiler :/
+    let mut vec: Vec<u64> = repeat(0x5555555555555555u64)
+        .take(1234)
+        .chain(repeat(0u64).take(1000))
+        .chain(repeat(0xFFFFFFFFFFFFFFFFu64).take(500))
+        .chain(repeat(0xbbae187bfcdd3b05u64).take(1234))
+        .chain(repeat(0xd7156e450545b7adu64).take(1456))
+        .chain(repeat(0u64).take(7500))
+        .chain(repeat(0x5555555555555555u64).take(55))
+        .chain(repeat(0u64).take(50))
+        .collect();
+    vec.extend(
+        repeat(0xFF00FF5500330210u64)
+            .take(2500)
+            .chain(repeat(0u64).take(7))
+            .chain(repeat(0x1228b38cf8ef551bu64).take(1500))
+            .chain(repeat(0x5555555555555555u64).take(1156))
+            .chain(repeat(0u64).take(42)),
+    );
+    vec.resize(16384, 0xFFFFFFFF00000000u64);
 
-        // a single long sequence of chains trips up the compiler :/
-        let mut vec: Vec<u64> = repeat(0x5555555555555555u64)
-            .take(1234)
-            .chain(repeat(0u64).take(1000))
-            .chain(repeat(0xFFFFFFFFFFFFFFFFu64).take(500))
-            .chain(repeat(0xbbae187bfcdd3b05u64).take(1234))
-            .chain(repeat(0xd7156e450545b7adu64).take(1456))
-            .chain(repeat(0u64).take(7500))
-            .chain(repeat(0x5555555555555555u64).take(55))
-            .chain(repeat(0u64).take(50))
-            .collect();
-        vec.extend(
-            repeat(0xFF00FF5500330210u64)
-                .take(2500)
-                .chain(repeat(0u64).take(7))
-                .chain(repeat(0x1228b38cf8ef551bu64).take(1500))
-                .chain(repeat(0x5555555555555555u64).take(1156))
-                .chain(repeat(0u64).take(42)),
-        );
-        vec.resize(16384, 0xFFFFFFFF00000000u64);
+    vec
+}
 
-        vec
-    }
+fn interleaved_buf() -> Vec<u64> {
+    vec![0x5555555555555555u64; 16384]
+}
 
-    fn interleaved_buf() -> Vec<u64> {
-        vec![0x5555555555555555u64; 16384]
-    }
-
-    fn random_num_buf() -> Vec<u64> {
-        vec![0xbbae187bfcdd3b05u64; 16384]
-    }
+fn random_num_buf() -> Vec<u64> {
+    vec![0xbbae187bfcdd3b05u64; 16384]
+}
 #[cfg(test)]
 mod tests {
     use super::*;
