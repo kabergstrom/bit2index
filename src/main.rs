@@ -756,8 +756,8 @@ where
     return pos;
 }
 
-const TEST_BUF_SIZE: usize = 4 * 64 * 64 * 64;
-// const TEST_BUF_SIZE: usize = (256 * 1024 * 1024);
+const TEST_BUF_SIZE: usize = 4 * 64 * 64;
+// const TEST_BUF_SIZE: usize = (256 * 1024 * 1024) / 64;
 
 fn empty_buf() -> Vec<u64> {
     vec![0; TEST_BUF_SIZE]
